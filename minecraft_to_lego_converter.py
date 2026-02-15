@@ -124,7 +124,7 @@ class MinecraftToLegoConverter:
             "wheat", "carrots", "potatoes", "beetroots", "nether_wart",
             "cocoa", "melon_stem", "pumpkin_stem",
             "attached_melon_stem", "attached_pumpkin_stem",
-            # Heads, banners, beds (complex shapes that don't work as cubes)
+            # Heads (tiny, don't fill block)
             "skeleton_skull", "skeleton_wall_skull",
             "wither_skeleton_skull", "wither_skeleton_wall_skull",
             "zombie_head", "zombie_wall_head",
@@ -132,15 +132,8 @@ class MinecraftToLegoConverter:
             "creeper_head", "creeper_wall_head",
             "dragon_head", "dragon_wall_head",
             "piglin_head", "piglin_wall_head",
-            "white_banner", "orange_banner", "magenta_banner", "light_blue_banner",
-            "yellow_banner", "lime_banner", "pink_banner", "gray_banner",
-            "light_gray_banner", "cyan_banner", "purple_banner", "blue_banner",
-            "brown_banner", "green_banner", "red_banner", "black_banner",
-            "white_wall_banner", "orange_wall_banner", "magenta_wall_banner",
-            "light_blue_wall_banner", "yellow_wall_banner", "lime_wall_banner",
-            "pink_wall_banner", "gray_wall_banner", "light_gray_wall_banner",
-            "cyan_wall_banner", "purple_wall_banner", "blue_wall_banner",
-            "brown_wall_banner", "green_wall_banner", "red_wall_banner", "black_wall_banner",
+            # NOTE: Banners are kept as full bricks — they represent flags,
+            # markers, and decorations that should be visible in the model.
             # Brewing, enchanting, anvil (irregular shapes)
             "brewing_stand", "cauldron", "water_cauldron", "lava_cauldron",
             "powder_snow_cauldron", "anvil", "chipped_anvil", "damaged_anvil",
