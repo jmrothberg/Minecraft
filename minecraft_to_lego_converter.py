@@ -1025,18 +1025,10 @@ class MinecraftToLegoConverter:
         count = 0
 
         if special_info and special_info["type"] == "stair":
-            half = special_info.get("half", "bottom")
-            # Stair = full 2x2 brick (tall side) + 2x2 plate (step side)
-            # Both centered on block — no X/Z offset needed, stays on stud grid
-            # 3003 = 2x2 brick (24 LDU), 3022 = 2x2 plate (8 LDU)
-            if half == "bottom":
-                # Bottom: full brick, Top: plate (step is shorter on top)
-                ldraw_lines.append(f"1 {color_id} {base_x:.2f} {base_y + 24:.2f} {base_z:.2f} {identity} 3003.dat")
-                ldraw_lines.append(f"1 {color_id} {base_x:.2f} {base_y + 16:.2f} {base_z:.2f} {identity} 3022.dat")
-            else:
-                # Inverted: plate on bottom, full brick on top
-                ldraw_lines.append(f"1 {color_id} {base_x:.2f} {base_y:.2f} {base_z:.2f} {identity} 3003.dat")
-                ldraw_lines.append(f"1 {color_id} {base_x:.2f} {base_y + 24:.2f} {base_z:.2f} {identity} 3022.dat")
+            # At 2x, stairs are full blocks — the staircase shape comes from
+            # block positions in Minecraft, not from special LEGO parts
+            ldraw_lines.append(f"1 {color_id} {base_x:.2f} {base_y:.2f} {base_z:.2f} {identity} 3003.dat")
+            ldraw_lines.append(f"1 {color_id} {base_x:.2f} {base_y + 24:.2f} {base_z:.2f} {identity} 3003.dat")
             count = 2
 
         elif special_info and special_info["type"] == "slab":
