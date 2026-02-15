@@ -44,6 +44,123 @@ class MinecraftToLegoConverter:
             (2, 2): "3003",   # 2x2 brick
         }
 
+        # Non-solid blocks to skip — these don't fill a full block in Minecraft
+        # and look wrong as 1x1 bricks. Removing them cleans up the model.
+        self.skip_blocks = {
+            # Torches and light sources
+            "torch", "wall_torch", "soul_torch", "soul_wall_torch",
+            "redstone_torch", "redstone_wall_torch", "lantern", "soul_lantern",
+            "candle", "candle_cake",
+            "white_candle", "orange_candle", "magenta_candle", "light_blue_candle",
+            "yellow_candle", "lime_candle", "pink_candle", "gray_candle",
+            "light_gray_candle", "cyan_candle", "purple_candle", "blue_candle",
+            "brown_candle", "green_candle", "red_candle", "black_candle",
+            # Signs
+            "oak_sign", "spruce_sign", "birch_sign", "jungle_sign",
+            "acacia_sign", "dark_oak_sign", "mangrove_sign", "cherry_sign",
+            "bamboo_sign", "crimson_sign", "warped_sign",
+            "oak_wall_sign", "spruce_wall_sign", "birch_wall_sign", "jungle_wall_sign",
+            "acacia_wall_sign", "dark_oak_wall_sign", "mangrove_wall_sign", "cherry_wall_sign",
+            "bamboo_wall_sign", "crimson_wall_sign", "warped_wall_sign",
+            "oak_hanging_sign", "spruce_hanging_sign", "birch_hanging_sign",
+            "jungle_hanging_sign", "acacia_hanging_sign", "dark_oak_hanging_sign",
+            "mangrove_hanging_sign", "cherry_hanging_sign", "bamboo_hanging_sign",
+            "crimson_hanging_sign", "warped_hanging_sign",
+            # Buttons and pressure plates
+            "stone_button", "oak_button", "spruce_button", "birch_button",
+            "jungle_button", "acacia_button", "dark_oak_button", "mangrove_button",
+            "cherry_button", "bamboo_button", "crimson_button", "warped_button",
+            "polished_blackstone_button",
+            "stone_pressure_plate", "oak_pressure_plate", "spruce_pressure_plate",
+            "birch_pressure_plate", "jungle_pressure_plate", "acacia_pressure_plate",
+            "dark_oak_pressure_plate", "mangrove_pressure_plate", "cherry_pressure_plate",
+            "bamboo_pressure_plate", "crimson_pressure_plate", "warped_pressure_plate",
+            "light_weighted_pressure_plate", "heavy_weighted_pressure_plate",
+            "polished_blackstone_pressure_plate",
+            # Redstone components
+            "redstone_wire", "repeater", "comparator", "lever",
+            "tripwire", "tripwire_hook",
+            # Rails
+            "rail", "powered_rail", "detector_rail", "activator_rail",
+            # Doors and trapdoors (thin, don't fill block)
+            "oak_door", "spruce_door", "birch_door", "jungle_door",
+            "acacia_door", "dark_oak_door", "mangrove_door", "cherry_door",
+            "bamboo_door", "crimson_door", "warped_door", "iron_door",
+            "oak_trapdoor", "spruce_trapdoor", "birch_trapdoor", "jungle_trapdoor",
+            "acacia_trapdoor", "dark_oak_trapdoor", "mangrove_trapdoor", "cherry_trapdoor",
+            "bamboo_trapdoor", "crimson_trapdoor", "warped_trapdoor", "iron_trapdoor",
+            # Flowers and small plants
+            "dandelion", "poppy", "blue_orchid", "allium", "azure_bluet",
+            "red_tulip", "orange_tulip", "white_tulip", "pink_tulip",
+            "oxeye_daisy", "cornflower", "lily_of_the_valley", "wither_rose",
+            "torchflower", "pitcher_plant",
+            "sunflower", "lilac", "rose_bush", "peony",
+            "grass", "tall_grass", "fern", "large_fern", "dead_bush",
+            "seagrass", "tall_seagrass", "kelp", "kelp_plant",
+            "sweet_berry_bush", "cave_vines", "cave_vines_plant",
+            "hanging_roots", "spore_blossom", "glow_lichen", "sculk_vein",
+            # Saplings
+            "oak_sapling", "spruce_sapling", "birch_sapling", "jungle_sapling",
+            "acacia_sapling", "dark_oak_sapling", "mangrove_propagule", "cherry_sapling",
+            "bamboo_sapling",
+            # Misc non-solid
+            "ladder", "vine", "sugar_cane", "lily_pad",
+            "cobweb", "string",
+            "fire", "soul_fire",
+            "end_rod", "lightning_rod", "chain",
+            "scaffolding", "pointed_dripstone",
+            "flower_pot", "potted_oak_sapling", "potted_spruce_sapling",
+            "potted_birch_sapling", "potted_jungle_sapling", "potted_acacia_sapling",
+            "potted_dark_oak_sapling", "potted_mangrove_propagule", "potted_cherry_sapling",
+            "potted_fern", "potted_dandelion", "potted_poppy", "potted_blue_orchid",
+            "potted_allium", "potted_azure_bluet", "potted_red_tulip",
+            "potted_orange_tulip", "potted_white_tulip", "potted_pink_tulip",
+            "potted_oxeye_daisy", "potted_cornflower", "potted_lily_of_the_valley",
+            "potted_wither_rose", "potted_dead_bush",
+            "potted_cactus", "potted_bamboo", "potted_crimson_fungus", "potted_warped_fungus",
+            "potted_crimson_roots", "potted_warped_roots", "potted_azalea_bush",
+            "potted_flowering_azalea_bush", "potted_torchflower",
+            # Crops (thin)
+            "wheat", "carrots", "potatoes", "beetroots", "nether_wart",
+            "cocoa", "melon_stem", "pumpkin_stem",
+            "attached_melon_stem", "attached_pumpkin_stem",
+            # Heads, banners, beds (complex shapes that don't work as cubes)
+            "skeleton_skull", "skeleton_wall_skull",
+            "wither_skeleton_skull", "wither_skeleton_wall_skull",
+            "zombie_head", "zombie_wall_head",
+            "player_head", "player_wall_head",
+            "creeper_head", "creeper_wall_head",
+            "dragon_head", "dragon_wall_head",
+            "piglin_head", "piglin_wall_head",
+            "white_banner", "orange_banner", "magenta_banner", "light_blue_banner",
+            "yellow_banner", "lime_banner", "pink_banner", "gray_banner",
+            "light_gray_banner", "cyan_banner", "purple_banner", "blue_banner",
+            "brown_banner", "green_banner", "red_banner", "black_banner",
+            "white_wall_banner", "orange_wall_banner", "magenta_wall_banner",
+            "light_blue_wall_banner", "yellow_wall_banner", "lime_wall_banner",
+            "pink_wall_banner", "gray_wall_banner", "light_gray_wall_banner",
+            "cyan_wall_banner", "purple_wall_banner", "blue_wall_banner",
+            "brown_wall_banner", "green_wall_banner", "red_wall_banner", "black_wall_banner",
+            # Brewing, enchanting, anvil (irregular shapes)
+            "brewing_stand", "cauldron", "water_cauldron", "lava_cauldron",
+            "powder_snow_cauldron", "anvil", "chipped_anvil", "damaged_anvil",
+            # Fence and fence gates (thin posts, not full blocks)
+            "oak_fence", "spruce_fence", "birch_fence", "jungle_fence",
+            "acacia_fence", "dark_oak_fence", "mangrove_fence", "cherry_fence",
+            "bamboo_fence", "crimson_fence", "warped_fence", "nether_brick_fence",
+            "oak_fence_gate", "spruce_fence_gate", "birch_fence_gate", "jungle_fence_gate",
+            "acacia_fence_gate", "dark_oak_fence_gate", "mangrove_fence_gate",
+            "cherry_fence_gate", "bamboo_fence_gate", "crimson_fence_gate", "warped_fence_gate",
+            # Walls (thin)
+            "cobblestone_wall", "mossy_cobblestone_wall", "stone_brick_wall",
+            "mossy_stone_brick_wall", "granite_wall", "diorite_wall", "andesite_wall",
+            "brick_wall", "sandstone_wall", "red_sandstone_wall", "prismarine_wall",
+            "nether_brick_wall", "red_nether_brick_wall", "blackstone_wall",
+            "polished_blackstone_wall", "polished_blackstone_brick_wall",
+            "end_stone_brick_wall", "cobbled_deepslate_wall", "polished_deepslate_wall",
+            "deepslate_brick_wall", "deepslate_tile_wall", "mud_brick_wall",
+        }
+
         # Special parts for stairs and slabs
         # Note: Glass panes use regular translucent bricks
         self.special_parts = {
@@ -635,6 +752,13 @@ class MinecraftToLegoConverter:
             vals[i] = -vals[i]
         return " ".join(str(int(v)) if v == int(v) else str(v) for v in vals)
 
+    def _is_skip_block(self, block_name: str) -> bool:
+        """Check if a block should be skipped (non-solid, doesn't fill a full cube)."""
+        name = block_name.replace("minecraft:", "")
+        if "[" in name:
+            name = name.split("[")[0]
+        return name in self.skip_blocks
+
     def _get_color_from_block_name(self, block_name: str) -> int:
         """Get LDraw color directly from Minecraft block name (for .schem format)"""
         name = block_name.replace("minecraft:", "")
@@ -970,6 +1094,9 @@ class MinecraftToLegoConverter:
                             # Skip air blocks
                             if color_id == -1:
                                 continue
+                            # Skip non-solid blocks (torches, signs, doors, etc.)
+                            if self._is_skip_block(block_name):
+                                continue
                         else:
                             color_id = 7  # Default gray
                     else:
@@ -1065,6 +1192,9 @@ class MinecraftToLegoConverter:
                             block_name = block_names[data_index]
                             color_id = self._get_color_from_block_name(block_name)
                             if color_id == -1:  # Skip air
+                                continue
+                            # Skip non-solid blocks (torches, signs, doors, etc.)
+                            if self._is_skip_block(block_name):
                                 continue
 
                             # Check if this is a special block (stairs, slabs, etc.)
