@@ -145,8 +145,8 @@ class MinecraftToLegoConverter:
             "brewing_stand", "cauldron", "water_cauldron", "lava_cauldron",
             "powder_snow_cauldron", "anvil", "chipped_anvil", "damaged_anvil",
             # NOTE: Fences, fence gates, and walls are kept as full bricks.
-            # They're thin in Minecraft but often serve as structural supports
-            # (e.g. umbrella poles, railings). Removing them causes floating structures.
+            # They're thin in Minecraft but commonly serve as structural supports
+            # (columns, railings, table legs, etc). Skipping them causes floating structures.
         }
 
         # Special parts for stairs and slabs
