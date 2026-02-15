@@ -901,30 +901,18 @@ class MinecraftToLegoConverter:
         count = 0
 
         if special_info and special_info["type"] == "stair":
-            facing = special_info.get("facing", "north")
             half = special_info.get("half", "bottom")
-            # L-shaped stair: full 2x2 on one layer, 1x2 half-brick on the other
-            # Top layer offset/rotation for 3004 based on facing direction
-            # 3004 = 1x2 brick (20 LDU in X, 40 LDU in Z at identity)
-            stair_top_config = {
-                # For N/S facing: rotate 3004 90 deg so it's 40x20, offset in Z
-                "north": ("0 0 -1 0 1 0 1 0 0", 0, 10),
-                "south": ("0 0 -1 0 1 0 1 0 0", 0, -10),
-                # For E/W facing: 3004 at identity (20x40), offset in X
-                "east":  (identity, -10, 0),
-                "west":  (identity, 10, 0),
-            }
-            rot_1x2, dx, dz = stair_top_config.get(facing, stair_top_config["north"])
-
+            # Stair = full 2x2 brick (tall side) + 2x2 plate (step side)
+            # Both centered on block — no X/Z offset needed, stays on stud grid
+            # 3003 = 2x2 brick (24 LDU), 3022 = 2x2 plate (8 LDU)
             if half == "bottom":
-                # Bottom layer: full 2x2 brick
+                # Bottom: full brick, Top: plate (step is shorter on top)
                 ldraw_lines.append(f"1 {color_id} {base_x:.2f} {base_y + 24:.2f} {base_z:.2f} {identity} 3003.dat")
-                # Top layer: 1x2 brick on the back (tall) side
-                ldraw_lines.append(f"1 {color_id} {base_x + dx:.2f} {base_y:.2f} {base_z + dz:.2f} {rot_1x2} 3004.dat")
+                ldraw_lines.append(f"1 {color_id} {base_x:.2f} {base_y + 16:.2f} {base_z:.2f} {identity} 3022.dat")
             else:
-                # Inverted: top layer full 2x2, bottom layer half 1x2
+                # Inverted: plate on bottom, full brick on top
                 ldraw_lines.append(f"1 {color_id} {base_x:.2f} {base_y:.2f} {base_z:.2f} {identity} 3003.dat")
-                ldraw_lines.append(f"1 {color_id} {base_x + dx:.2f} {base_y + 24:.2f} {base_z + dz:.2f} {rot_1x2} 3004.dat")
+                ldraw_lines.append(f"1 {color_id} {base_x:.2f} {base_y + 24:.2f} {base_z:.2f} {identity} 3022.dat")
             count = 2
 
         elif special_info and special_info["type"] == "slab":

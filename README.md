@@ -100,8 +100,8 @@ The default 1:1 conversion maps each Minecraft block to a single 1x1 LEGO brick.
 
 | Block Type | 1x scale (default) | 2x scale (`-2x`) |
 |------------|--------------------|--------------------|
-| **Stairs** | Cheese slope — angled approximation, no step shape | **L-shaped step**: full 2×2 brick on bottom + 1×2 brick on the tall side. Actual step geometry matching Minecraft |
-| **Inverted stairs** | Not supported (rendered same as normal stairs) | **Correctly flipped**: full brick on top layer, step on bottom, matching Minecraft ceiling stairs |
+| **Stairs** | Cheese slope — angled approximation, no step shape | **Stepped profile**: full 2×2 brick (tall side) + 2×2 plate (step side). Clear height difference matching Minecraft |
+| **Inverted stairs** | Not supported (rendered same as normal stairs) | **Correctly flipped**: full brick on top, plate on bottom, matching Minecraft ceiling stairs |
 | **Slabs** | Plate (8 LDU = 1/3 brick height) — wrong ratio, slabs should be 1/2 | **Single 2×2 brick = exactly half** the 2-brick block height. Perfect 1/2 ratio |
 | **Carpet** | Plate (oversized relative to block) | **2×2 plate** at correct floor level within the block space |
 | **Full blocks** | 1×1 brick | Two stacked 2×2 bricks (fills the full 2-brick height) |
@@ -112,19 +112,20 @@ The default 1:1 conversion maps each Minecraft block to a single 1x1 LEGO brick.
 
 ### How it works at 2x scale
 
-A Minecraft stair block (e.g. `oak_stairs[facing=north,half=bottom]`) becomes two LEGO bricks arranged in an L-shape:
+A Minecraft stair block (e.g. `oak_stairs[facing=north,half=bottom]`) becomes a 2×2 brick topped by a 2×2 plate:
 
 ```
-     ┌─────┐
-     │3004 │  ← 1×2 brick (rotated), only on the tall side
-     │     │
-┌────┴─────┤
-│  3003    │  ← 2×2 brick, full footprint
-│          │
-└──────────┘
+  ┌──────────┐
+  │  3022    │  ← 2×2 plate (8 LDU) — the step (shorter)
+  ├──────────┤
+  │          │
+  │  3003    │  ← 2×2 brick (24 LDU) — the tall side
+  │          │
+  └──────────┘
+  Total: 32 LDU vs 48 LDU full block — visible step-down
 ```
 
-The `facing` direction determines which side gets the upper brick, and `half=top` (inverted/ceiling stairs) flips the layers. This matches how Minecraft stairs actually look — an L-shaped step, not a slope.
+The brick+plate combo (32 LDU) is shorter than a full block (48 LDU), creating a clear step. `half=top` (inverted/ceiling stairs) swaps the layers — brick on top, plate on bottom.
 
 ## Setting Up on a New System
 
