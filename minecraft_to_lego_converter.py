@@ -1122,7 +1122,9 @@ class MinecraftToLegoConverter:
                         brick_type = self.default_brick
                         rotation = "1 0 0 0 1 0 0 0 1"
                         y_offset = 0
-                        if special_info:
+                        # At 1x, only slabs/carpet get special parts.
+                        # Stairs use regular bricks (no room for sub-block slopes at 1 stud).
+                        if special_info and special_info["type"] != "stair":
                             brick_type = special_info["part"]
                             rotation = special_info["rotation"]
                             y_offset = special_info["y_offset"]
@@ -1187,8 +1189,9 @@ class MinecraftToLegoConverter:
                             if self._is_skip_block(block_name):
                                 continue
 
-                            # Check if this is a special block (stairs, slabs, etc.)
-                            if self._get_special_part_info(block_name):
+                            # Check if this is a special block (slabs, carpet, stairs at 2x)
+                            sp = self._get_special_part_info(block_name)
+                            if sp and (scale > 1 or sp["type"] != "stair"):
                                 special_blocks[y, z, x] = True
                         else:
                             color_id = 7
