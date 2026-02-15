@@ -144,21 +144,9 @@ class MinecraftToLegoConverter:
             # Brewing, enchanting, anvil (irregular shapes)
             "brewing_stand", "cauldron", "water_cauldron", "lava_cauldron",
             "powder_snow_cauldron", "anvil", "chipped_anvil", "damaged_anvil",
-            # Fence and fence gates (thin posts, not full blocks)
-            "oak_fence", "spruce_fence", "birch_fence", "jungle_fence",
-            "acacia_fence", "dark_oak_fence", "mangrove_fence", "cherry_fence",
-            "bamboo_fence", "crimson_fence", "warped_fence", "nether_brick_fence",
-            "oak_fence_gate", "spruce_fence_gate", "birch_fence_gate", "jungle_fence_gate",
-            "acacia_fence_gate", "dark_oak_fence_gate", "mangrove_fence_gate",
-            "cherry_fence_gate", "bamboo_fence_gate", "crimson_fence_gate", "warped_fence_gate",
-            # Walls (thin)
-            "cobblestone_wall", "mossy_cobblestone_wall", "stone_brick_wall",
-            "mossy_stone_brick_wall", "granite_wall", "diorite_wall", "andesite_wall",
-            "brick_wall", "sandstone_wall", "red_sandstone_wall", "prismarine_wall",
-            "nether_brick_wall", "red_nether_brick_wall", "blackstone_wall",
-            "polished_blackstone_wall", "polished_blackstone_brick_wall",
-            "end_stone_brick_wall", "cobbled_deepslate_wall", "polished_deepslate_wall",
-            "deepslate_brick_wall", "deepslate_tile_wall", "mud_brick_wall",
+            # NOTE: Fences, fence gates, and walls are kept as full bricks.
+            # They're thin in Minecraft but often serve as structural supports
+            # (e.g. umbrella poles, railings). Removing them causes floating structures.
         }
 
         # Special parts for stairs and slabs
@@ -1025,10 +1013,20 @@ class MinecraftToLegoConverter:
         count = 0
 
         if special_info and special_info["type"] == "stair":
-            # At 2x, stairs are full blocks — the staircase shape comes from
-            # block positions in Minecraft, not from special LEGO parts
-            ldraw_lines.append(f"1 {color_id} {base_x:.2f} {base_y:.2f} {base_z:.2f} {identity} 3003.dat")
-            ldraw_lines.append(f"1 {color_id} {base_x:.2f} {base_y + 24:.2f} {base_z:.2f} {identity} 3003.dat")
+            facing = special_info.get("facing", "north")
+            half = special_info.get("half", "bottom")
+            # At 2x, 3039 (2x2 slope) fits perfectly: 40x40 LDU = 2 studs.
+            # Bottom brick (3003) + slope on top (3039) = 24+24 = 48 LDU = full block.
+            rotation = self.rotations.get(facing, self.rotations["north"])
+            if half == "bottom":
+                # Full brick on bottom, slope on top
+                ldraw_lines.append(f"1 {color_id} {base_x:.2f} {base_y + 24:.2f} {base_z:.2f} {identity} 3003.dat")
+                ldraw_lines.append(f"1 {color_id} {base_x:.2f} {base_y:.2f} {base_z:.2f} {rotation} 3039.dat")
+            else:
+                # Inverted: brick on top, flipped slope on bottom
+                flipped = self._flip_rotation_y(rotation)
+                ldraw_lines.append(f"1 {color_id} {base_x:.2f} {base_y:.2f} {base_z:.2f} {identity} 3003.dat")
+                ldraw_lines.append(f"1 {color_id} {base_x:.2f} {base_y + 24:.2f} {base_z:.2f} {flipped} 3039.dat")
             count = 2
 
         elif special_info and special_info["type"] == "slab":
