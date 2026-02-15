@@ -11,6 +11,13 @@ __pycache__/
 .venv/
 venv/
 
+# Backup files
+*_backup.py
+
 # OS
 .DS_Store
 Thumbs.db
+
+# IDE
+.idea/
+.vscode/

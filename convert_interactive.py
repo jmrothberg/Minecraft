@@ -1,7 +1,9 @@
 #!/usr/bin/env python3
 """
-Interactive Minecraft to Lego Converter
-Console-driven GUI for easy file selection and conversion
+Jonathan Rothberg's MineCraft to LEGO converter
+
+Interactive console GUI for easy file selection and conversion.
+Browse .schematic and .schem files, pick by number, and convert to LDraw (.ldr).
 """
 
 import os
@@ -16,11 +18,14 @@ def clear_screen():
     print("\033[2J\033[H", end="")
 
 def list_schematic_files():
-    """List all .schematic and .schem files in current directory"""
-    schematic_files = glob.glob("*.schematic")
-    schematic_files.extend(glob.glob("*.SCHEMATIC"))  # Case insensitive
-    schematic_files.extend(glob.glob("*.schem"))      # New Sponge/WorldEdit format
-    schematic_files.extend(glob.glob("*.SCHEM"))
+    """List all .schematic and .schem files in schematics/ directory"""
+    script_dir = os.path.dirname(os.path.abspath(__file__))
+    schem_dir = os.path.join(script_dir, "schematics")
+    os.makedirs(schem_dir, exist_ok=True)
+    schematic_files = glob.glob(os.path.join(schem_dir, "*.schematic"))
+    schematic_files.extend(glob.glob(os.path.join(schem_dir, "*.SCHEMATIC")))
+    schematic_files.extend(glob.glob(os.path.join(schem_dir, "*.schem")))
+    schematic_files.extend(glob.glob(os.path.join(schem_dir, "*.SCHEM")))
     return sorted(list(set(schematic_files)))  # Remove duplicates
 
 def get_file_info(filepath):
@@ -127,21 +132,26 @@ def get_user_choice(max_choice):
             sys.exit(0)
 
 def get_output_filename(input_filename):
-    """Get output filename from user"""
-    base_name = os.path.splitext(input_filename)[0]
+    """Get output filename from user, saving to models/ directory"""
+    script_dir = os.path.dirname(os.path.abspath(__file__))
+    models_dir = os.path.join(script_dir, "models")
+    os.makedirs(models_dir, exist_ok=True)
 
-    print(f"\n📝 Output filename for '{input_filename}':")
-    print(f"   Default: {base_name}.ldr")
+    base_name = os.path.splitext(os.path.basename(input_filename))[0]
+    default_output = os.path.join(models_dir, f"{base_name}.ldr")
+
+    print(f"\n📝 Output filename for '{os.path.basename(input_filename)}':")
+    print(f"   Default: models/{base_name}.ldr")
 
     while True:
         choice = input("Enter filename (or press Enter for default): ").strip()
 
         if not choice:
-            return f"{base_name}.ldr"
+            return default_output
         elif choice.lower().endswith('.ldr'):
-            return choice
+            return os.path.join(models_dir, choice)
         else:
-            return f"{choice}.ldr"
+            return os.path.join(models_dir, f"{choice}.ldr")
 
 def show_conversion_progress(converter, schematic_file, output_file, optimize=False):
     """Show conversion progress with animation"""

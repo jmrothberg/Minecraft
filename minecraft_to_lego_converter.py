@@ -1,9 +1,11 @@
 #!/usr/bin/env python3
 """
-Minecraft to Lego Converter
-Converts Minecraft schematic files to LDraw format for Lego Digital Designer
+Jonathan Rothberg's MineCraft to LEGO converter
 
-Author: CodeRunner IDE
+Converts Minecraft schematic files (.schematic, .schem) to LDraw format (.ldr)
+for viewing and editing in LeoCAD and other LEGO CAD software.
+
+Author: Jonathan Rothberg
 Created: 2026-01-04
 """
 
@@ -849,9 +851,9 @@ class MinecraftToLegoConverter:
         length = schematic_data['length']
 
         ldraw_lines = []
-        ldraw_lines.append("0 Untitled")
+        ldraw_lines.append("0 Jonathan Rothberg's MineCraft to LEGO converter")
         ldraw_lines.append("0 Name: Converted from Minecraft")
-        ldraw_lines.append("0 Author: CodeRunner IDE Converter")
+        ldraw_lines.append("0 Author: Jonathan Rothberg")
         if optimize:
             ldraw_lines.append("0 Optimized: Yes (merged bricks)")
         ldraw_lines.append("")
