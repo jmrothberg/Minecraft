@@ -48,7 +48,7 @@ class MinecraftToLegoConverter:
         # Note: Glass panes use regular translucent bricks
         self.special_parts = {
             "slab": "3024",      # 1x1 plate (for half blocks)
-            "stair": "3039",     # 2x2 slope brick (better for right triangle stairs)
+            "stair": "54200",    # 1x1x2/3 cheese slope - fits 1-stud grid
         }
 
         # Rotation matrices for LDraw (3x3 matrix as 9 values: a b c d e f g h i)
@@ -570,13 +570,19 @@ class MinecraftToLegoConverter:
                 print(f"   DEBUG: Stair detected: {block_name}")
                 self._stair_debug_count += 1
             facing = props.get("facing", "north")
+            half = props.get("half", "bottom")
             rotation = self.rotations.get(facing, self.rotations["north"])
             y_offset = 0
+            if half == "top":
+                rotation = self._flip_rotation_y(rotation)
+                y_offset = 24  # Flip to bottom of block space
             return {
                 "part": self.special_parts["stair"],
                 "rotation": rotation,
                 "y_offset": y_offset,
-                "type": "stair"
+                "type": "stair",
+                "facing": facing,
+                "half": half,
             }
         
         # Check if this is a slab
@@ -587,17 +593,22 @@ class MinecraftToLegoConverter:
             if self._slab_debug_count < 5:
                 print(f"   DEBUG: Slab detected: {block_name} (type={props.get('type', 'bottom')})")
                 self._slab_debug_count += 1
+            slab_type = props.get("type", "bottom")
+            # Double slab = full block, treat as regular brick
+            if slab_type == "double":
+                return None
             # In LDraw, positive Y is DOWN
             # Bottom slab: move plate down to bottom of brick space
             # Top slab: keep at top of brick space
             y_offset = 16  # Default: bottom slab (move down)
-            if props.get("type") == "top":
+            if slab_type == "top":
                 y_offset = 0  # Top slab stays at top
             return {
                 "part": self.special_parts["slab"],
                 "rotation": self.rotations["north"],
                 "y_offset": y_offset,
-                "type": "slab"
+                "type": "slab",
+                "slab_type": slab_type,
             }
 
         # Check if this is a carpet (thin 1/3 height like a plate, sits on floor)
@@ -606,7 +617,7 @@ class MinecraftToLegoConverter:
                 "part": self.special_parts["slab"],  # Use plate for carpet
                 "rotation": self.rotations["north"],
                 "y_offset": 16,  # Move down to floor level
-                "type": "slab"  # Count as slab for stats
+                "type": "carpet",
             }
         
         # Glass panes and iron bars - just use regular translucent/gray bricks
@@ -614,6 +625,15 @@ class MinecraftToLegoConverter:
         
         # Not a special block
         return None
+
+    def _flip_rotation_y(self, rotation_str: str) -> str:
+        """Flip a rotation matrix 180 degrees around the X axis (for inverted stairs).
+        Negates the Y-row and Z-row of the 3x3 rotation matrix."""
+        vals = list(map(float, rotation_str.split()))
+        # Negate Y row (indices 3,4,5) and Z row (indices 6,7,8)
+        for i in range(3, 9):
+            vals[i] = -vals[i]
+        return " ".join(str(int(v)) if v == int(v) else str(v) for v in vals)
 
     def _get_color_from_block_name(self, block_name: str) -> int:
         """Get LDraw color directly from Minecraft block name (for .schem format)"""
@@ -834,13 +854,14 @@ class MinecraftToLegoConverter:
 
         return brick_type, color_id
 
-    def convert_to_ldraw(self, schematic_data: Dict, optimize: bool = False) -> str:
+    def convert_to_ldraw(self, schematic_data: Dict, optimize: bool = False, scale: int = 1) -> str:
         """
         Convert schematic data to LDraw format
 
         Args:
             schematic_data: Loaded schematic data
             optimize: If True, merge adjacent same-color blocks into larger bricks
+            scale: Scale factor (1 = 1 stud per block, 2 = 2 studs per block)
 
         Returns:
             LDraw format string
@@ -856,28 +877,90 @@ class MinecraftToLegoConverter:
         ldraw_lines.append("0 Author: Jonathan Rothberg")
         if optimize:
             ldraw_lines.append("0 Optimized: Yes (merged bricks)")
+        if scale > 1:
+            ldraw_lines.append(f"0 Scale: {scale}x (each MC block = {scale} studs)")
         ldraw_lines.append("")
 
         brick_count = 0
 
         if optimize:
             # Optimized conversion - merge adjacent same-color blocks
-            brick_count = self._convert_optimized(schematic_data, ldraw_lines, width, height, length)
+            brick_count = self._convert_optimized(schematic_data, ldraw_lines, width, height, length, scale)
         else:
             # Standard 1x1 brick conversion
-            brick_count = self._convert_standard(schematic_data, ldraw_lines, width, height, length)
+            brick_count = self._convert_standard(schematic_data, ldraw_lines, width, height, length, scale)
 
         print(f"Converted to {brick_count} Lego bricks")
         return "\n".join(ldraw_lines)
 
-    def _convert_standard(self, schematic_data: Dict, ldraw_lines: List, width: int, height: int, length: int) -> int:
-        """Standard conversion - one 1x1 brick per Minecraft block"""
+    def _emit_block_2x(self, ldraw_lines: List, base_x: float, base_y: float, base_z: float,
+                       color_id: int, special_info: Optional[Dict]) -> int:
+        """Emit LEGO parts for a single MC block at 2x scale.
+        Returns the number of parts emitted."""
+        identity = "1 0 0 0 1 0 0 0 1"
+        count = 0
+
+        if special_info and special_info["type"] == "stair":
+            facing = special_info.get("facing", "north")
+            half = special_info.get("half", "bottom")
+            # L-shaped stair: full 2x2 on one layer, 1x2 half-brick on the other
+            # Top layer offset/rotation for 3004 based on facing direction
+            # 3004 = 1x2 brick (20 LDU in X, 40 LDU in Z at identity)
+            stair_top_config = {
+                # For N/S facing: rotate 3004 90 deg so it's 40x20, offset in Z
+                "north": ("0 0 -1 0 1 0 1 0 0", 0, 10),
+                "south": ("0 0 -1 0 1 0 1 0 0", 0, -10),
+                # For E/W facing: 3004 at identity (20x40), offset in X
+                "east":  (identity, -10, 0),
+                "west":  (identity, 10, 0),
+            }
+            rot_1x2, dx, dz = stair_top_config.get(facing, stair_top_config["north"])
+
+            if half == "bottom":
+                # Bottom layer: full 2x2 brick
+                ldraw_lines.append(f"1 {color_id} {base_x:.2f} {base_y + 24:.2f} {base_z:.2f} {identity} 3003.dat")
+                # Top layer: 1x2 brick on the back (tall) side
+                ldraw_lines.append(f"1 {color_id} {base_x + dx:.2f} {base_y:.2f} {base_z + dz:.2f} {rot_1x2} 3004.dat")
+            else:
+                # Inverted: top layer full 2x2, bottom layer half 1x2
+                ldraw_lines.append(f"1 {color_id} {base_x:.2f} {base_y:.2f} {base_z:.2f} {identity} 3003.dat")
+                ldraw_lines.append(f"1 {color_id} {base_x + dx:.2f} {base_y + 24:.2f} {base_z + dz:.2f} {rot_1x2} 3004.dat")
+            count = 2
+
+        elif special_info and special_info["type"] == "slab":
+            slab_type = special_info.get("slab_type", "bottom")
+            # Single 2x2 brick = exactly half the 48 LDU block height
+            if slab_type == "bottom":
+                ldraw_lines.append(f"1 {color_id} {base_x:.2f} {base_y + 24:.2f} {base_z:.2f} {identity} 3003.dat")
+            else:  # top
+                ldraw_lines.append(f"1 {color_id} {base_x:.2f} {base_y:.2f} {base_z:.2f} {identity} 3003.dat")
+            count = 1
+
+        elif special_info and special_info["type"] == "carpet":
+            # 2x2 plate at floor level (bottom of 48 LDU space)
+            ldraw_lines.append(f"1 {color_id} {base_x:.2f} {base_y + 40:.2f} {base_z:.2f} {identity} 3022.dat")
+            count = 1
+
+        else:
+            # Full block: two stacked 2x2 bricks (each 24 LDU tall = 48 total)
+            ldraw_lines.append(f"1 {color_id} {base_x:.2f} {base_y:.2f} {base_z:.2f} {identity} 3003.dat")
+            ldraw_lines.append(f"1 {color_id} {base_x:.2f} {base_y + 24:.2f} {base_z:.2f} {identity} 3003.dat")
+            count = 2
+
+        return count
+
+    def _convert_standard(self, schematic_data: Dict, ldraw_lines: List, width: int, height: int, length: int, scale: int = 1) -> int:
+        """Standard conversion - one brick per Minecraft block (or 2x scale parts)"""
         blocks = schematic_data['blocks']
         brick_count = 0
 
         # Check if we have block names (.schem format)
         has_block_names = 'block_names' in schematic_data and schematic_data['block_names'] is not None
         block_names = schematic_data.get('block_names', [])
+
+        # Scale-dependent sizes
+        stud_size = 20 * scale    # 20 at 1x, 40 at 2x
+        brick_height = 24 * scale  # 24 at 1x, 48 at 2x
 
         for y in range(height):
             for z in range(length):
@@ -910,42 +993,56 @@ class MinecraftToLegoConverter:
                                 data_value = schematic_data['data'][data_index]
                         _, color_id = self.get_brick_info(block_id, data_value)
 
-                    # Default brick type and rotation
-                    brick_type = self.default_brick
-                    rotation = "1 0 0 0 1 0 0 0 1"
-                    y_offset = 0
-
-                    # Check for special parts (stairs, slabs, panes) - only for .schem format
+                    # Check for special parts (stairs, slabs, carpet) - only for .schem format
+                    special_info = None
                     if block_name:
                         special_info = self._get_special_part_info(block_name)
+                        if special_info:
+                            if not hasattr(self, '_special_counts'):
+                                self._special_counts = {"stair": 0, "slab": 0, "carpet": 0}
+                            stype = special_info["type"]
+                            if stype in self._special_counts:
+                                self._special_counts[stype] += 1
+
+                    # Convert coordinates to LDraw units
+                    ldraw_x = (x - width / 2) * stud_size
+                    ldraw_y = -y * brick_height
+                    ldraw_z = (z - length / 2) * stud_size
+
+                    if scale == 2:
+                        brick_count += self._emit_block_2x(ldraw_lines, ldraw_x, ldraw_y, ldraw_z,
+                                                           color_id, special_info)
+                    else:
+                        # Scale 1: single part per block
+                        brick_type = self.default_brick
+                        rotation = "1 0 0 0 1 0 0 0 1"
+                        y_offset = 0
                         if special_info:
                             brick_type = special_info["part"]
                             rotation = special_info["rotation"]
                             y_offset = special_info["y_offset"]
-                            # Debug: count special parts
-                            if not hasattr(self, '_special_counts'):
-                                self._special_counts = {"stair": 0, "slab": 0}
-                            if special_info["type"] in self._special_counts:
-                                self._special_counts[special_info["type"]] += 1
 
-                    # Convert coordinates to LDraw units
-                    # LDraw: Y is negative going UP, 20 LDU = 1 stud width, 24 LDU = 1 brick height
-                    ldraw_x = (x - width/2) * 20
-                    ldraw_y = -y * 24 + y_offset
-                    ldraw_z = (z - length/2) * 20
-
-                    # Create LDraw line for this brick
-                    ldraw_line = f"1 {color_id} {ldraw_x:.2f} {ldraw_y:.2f} {ldraw_z:.2f} {rotation} {brick_type}.dat"
-                    ldraw_lines.append(ldraw_line)
-                    brick_count += 1
+                        ldraw_line = f"1 {color_id} {ldraw_x:.2f} {ldraw_y + y_offset:.2f} {ldraw_z:.2f} {rotation} {brick_type}.dat"
+                        ldraw_lines.append(ldraw_line)
+                        brick_count += 1
 
         # Print special part counts if any were found
         if hasattr(self, '_special_counts') and any(self._special_counts.values()):
-            print(f"   🔧 Special parts: {self._special_counts['stair']} slope bricks (stairs), {self._special_counts['slab']} plates (slabs)")
+            stair_ct = self._special_counts.get('stair', 0)
+            slab_ct = self._special_counts.get('slab', 0)
+            carpet_ct = self._special_counts.get('carpet', 0)
+            parts = []
+            if stair_ct:
+                parts.append(f"{stair_ct} stairs")
+            if slab_ct:
+                parts.append(f"{slab_ct} slabs")
+            if carpet_ct:
+                parts.append(f"{carpet_ct} carpets")
+            print(f"   Special parts: {', '.join(parts)}")
 
         return brick_count
 
-    def _convert_optimized(self, schematic_data: Dict, ldraw_lines: List, width: int, height: int, length: int) -> int:
+    def _convert_optimized(self, schematic_data: Dict, ldraw_lines: List, width: int, height: int, length: int, scale: int = 1) -> int:
         """Optimized conversion - merge adjacent same-color blocks into larger bricks"""
         blocks = schematic_data['blocks']
         brick_count = 0
@@ -954,12 +1051,16 @@ class MinecraftToLegoConverter:
         has_block_names = 'block_names' in schematic_data and schematic_data['block_names'] is not None
         block_names = schematic_data.get('block_names', [])
 
+        # Scale-dependent sizes
+        stud_size = 20 * scale
+        brick_height = 24 * scale
+
         # Build color grid (stores color_id for each position, -1 for air)
         color_grid = np.full((height, length, width), -1, dtype=np.int16)
         # Track special blocks that shouldn't be merged
         special_blocks = np.zeros((height, length, width), dtype=bool)
 
-        print("🔍 Analyzing blocks for optimization...")
+        print("Analyzing blocks for optimization...")
 
         for y in range(height):
             for z in range(length):
@@ -997,10 +1098,16 @@ class MinecraftToLegoConverter:
         # Track which cells have been used
         used = np.zeros((height, length, width), dtype=bool)
 
-        # Available brick lengths (X direction), sorted largest first
-        x_lengths = [8, 6, 4, 3, 2, 1]
+        # At scale=2, each MC block = 2 studs, so merge runs map to 2-wide bricks:
+        #   1 block = 3003 (2x2), 2 = 3001 (2x4), 3 = 2456 (2x6), 4 = 3007 (2x8)
+        if scale == 2:
+            scale2_x_lengths = [4, 3, 2, 1]
+            scale2_brick_map = {1: "3003", 2: "3001", 3: "2456", 4: "3007"}
+        else:
+            # Available brick lengths (X direction), sorted largest first
+            x_lengths = [8, 6, 4, 3, 2, 1]
 
-        print("🧱 Merging bricks (this may take a moment)...")
+        print("Merging bricks (this may take a moment)...")
 
         for y in range(height):
             for z in range(length):
@@ -1010,66 +1117,97 @@ class MinecraftToLegoConverter:
 
                     color_id = color_grid[y, z, x]
 
-                    # Try to find the longest run in X direction
-                    best_x_len = 1
-                    for x_len in x_lengths:
-                        if x + x_len > width:
-                            continue
-                        # Check if all cells in this run are same color and unused
-                        valid = True
-                        for dx in range(x_len):
-                            if used[y, z, x + dx] or color_grid[y, z, x + dx] != color_id:
-                                valid = False
-                                break
-                        if valid:
-                            best_x_len = x_len
-                            break
-
-                    # Try to extend in Z direction for 2-wide bricks
-                    best_z_len = 1
-                    if z + 1 < length and best_x_len >= 2:
-                        # Check if we can make a 2-wide brick
-                        can_extend_z = True
-                        for dx in range(best_x_len):
-                            if used[y, z + 1, x + dx] or color_grid[y, z + 1, x + dx] != color_id:
-                                can_extend_z = False
-                                break
-                        if can_extend_z:
-                            # Check if this 2-wide size exists
-                            if (2, best_x_len) in self.brick_sizes:
-                                best_z_len = 2
-
-                    # Get the brick part number
-                    brick_key = (best_z_len, best_x_len)
-                    if brick_key in self.brick_sizes:
-                        brick_type = self.brick_sizes[brick_key]
-                    else:
-                        # Fall back to 1x1 bricks
-                        brick_type = self.default_brick
+                    if scale == 2:
+                        # Scale 2: merge in X only, max 4 MC blocks
                         best_x_len = 1
-                        best_z_len = 1
+                        for x_len in scale2_x_lengths:
+                            if x + x_len > width:
+                                continue
+                            valid = True
+                            for dx in range(x_len):
+                                if (used[y, z, x + dx] or color_grid[y, z, x + dx] != color_id
+                                        or special_blocks[y, z, x + dx]):
+                                    valid = False
+                                    break
+                            if valid:
+                                best_x_len = x_len
+                                break
 
-                    # Mark cells as used
-                    for dz in range(best_z_len):
+                        # Mark cells as used
                         for dx in range(best_x_len):
-                            used[y, z + dz, x + dx] = True
+                            used[y, z, x + dx] = True
 
-                    # Calculate position (center of the brick)
-                    # LDraw positions are at the center of the brick
-                    center_x = x + (best_x_len - 1) / 2
-                    center_z = z + (best_z_len - 1) / 2
+                        # Get the 2-wide brick for this run length
+                        brick_type = scale2_brick_map[best_x_len]
 
-                    ldraw_x = (center_x - width/2) * 20
-                    ldraw_y = -y * 24
-                    ldraw_z = (center_z - length/2) * 20
+                        # Center of merged run in MC block coords
+                        center_x = x + (best_x_len - 1) / 2
 
-                    # Create LDraw line
-                    ldraw_line = f"1 {color_id} {ldraw_x:.2f} {ldraw_y:.2f} {ldraw_z:.2f} 1 0 0 0 1 0 0 0 1 {brick_type}.dat"
-                    ldraw_lines.append(ldraw_line)
-                    brick_count += 1
+                        ldraw_x = (center_x - width / 2) * stud_size
+                        ldraw_y = -y * brick_height
+                        ldraw_z = (z - length / 2) * stud_size
+
+                        identity = "1 0 0 0 1 0 0 0 1"
+                        # Emit two layers (top + bottom) for full blocks
+                        ldraw_lines.append(f"1 {color_id} {ldraw_x:.2f} {ldraw_y:.2f} {ldraw_z:.2f} {identity} {brick_type}.dat")
+                        ldraw_lines.append(f"1 {color_id} {ldraw_x:.2f} {ldraw_y + 24:.2f} {ldraw_z:.2f} {identity} {brick_type}.dat")
+                        brick_count += 2
+
+                    else:
+                        # Scale 1: existing merge logic
+                        best_x_len = 1
+                        for x_len in x_lengths:
+                            if x + x_len > width:
+                                continue
+                            valid = True
+                            for dx in range(x_len):
+                                if used[y, z, x + dx] or color_grid[y, z, x + dx] != color_id:
+                                    valid = False
+                                    break
+                            if valid:
+                                best_x_len = x_len
+                                break
+
+                        # Try to extend in Z direction for 2-wide bricks
+                        best_z_len = 1
+                        if z + 1 < length and best_x_len >= 2:
+                            can_extend_z = True
+                            for dx in range(best_x_len):
+                                if used[y, z + 1, x + dx] or color_grid[y, z + 1, x + dx] != color_id:
+                                    can_extend_z = False
+                                    break
+                            if can_extend_z:
+                                if (2, best_x_len) in self.brick_sizes:
+                                    best_z_len = 2
+
+                        # Get the brick part number
+                        brick_key = (best_z_len, best_x_len)
+                        if brick_key in self.brick_sizes:
+                            brick_type = self.brick_sizes[brick_key]
+                        else:
+                            brick_type = self.default_brick
+                            best_x_len = 1
+                            best_z_len = 1
+
+                        # Mark cells as used
+                        for dz in range(best_z_len):
+                            for dx in range(best_x_len):
+                                used[y, z + dz, x + dx] = True
+
+                        # Calculate position (center of the brick)
+                        center_x = x + (best_x_len - 1) / 2
+                        center_z = z + (best_z_len - 1) / 2
+
+                        ldraw_x = (center_x - width / 2) * 20
+                        ldraw_y = -y * 24
+                        ldraw_z = (center_z - length / 2) * 20
+
+                        ldraw_line = f"1 {color_id} {ldraw_x:.2f} {ldraw_y:.2f} {ldraw_z:.2f} 1 0 0 0 1 0 0 0 1 {brick_type}.dat"
+                        ldraw_lines.append(ldraw_line)
+                        brick_count += 1
 
         # Process special blocks (stairs, slabs, etc.) individually - don't merge them
-        print("🔧 Processing special blocks (stairs, slabs)...")
+        print("Processing special blocks (stairs, slabs)...")
         for y in range(height):
             for z in range(length):
                 for x in range(width):
@@ -1087,31 +1225,29 @@ class MinecraftToLegoConverter:
                     if not block_name:
                         continue
 
-                    # Get special part info (this will handle stairs, slabs, etc.)
                     special_info = self._get_special_part_info(block_name)
                     if not special_info:
                         continue
 
                     # Mark as used
                     used[y, z, x] = True
-
-                    # Get color
                     color_id = color_grid[y, z, x]
 
-                    # Apply special brick settings
-                    brick_type = special_info["part"]
-                    rotation = special_info["rotation"]
-                    y_offset = special_info["y_offset"]
+                    ldraw_x = (x - width / 2) * stud_size
+                    ldraw_y = -y * brick_height
+                    ldraw_z = (z - length / 2) * stud_size
 
-                    # Convert coordinates to LDraw units
-                    ldraw_x = (x - width/2) * 20
-                    ldraw_y = -y * 24 + y_offset
-                    ldraw_z = (z - length/2) * 20
+                    if scale == 2:
+                        brick_count += self._emit_block_2x(ldraw_lines, ldraw_x, ldraw_y, ldraw_z,
+                                                           color_id, special_info)
+                    else:
+                        brick_type = special_info["part"]
+                        rotation = special_info["rotation"]
+                        y_offset = special_info["y_offset"]
 
-                    # Create LDraw line with special rotation
-                    ldraw_line = f"1 {color_id} {ldraw_x:.2f} {ldraw_y:.2f} {ldraw_z:.2f} {rotation} {brick_type}.dat"
-                    ldraw_lines.append(ldraw_line)
-                    brick_count += 1
+                        ldraw_line = f"1 {color_id} {ldraw_x:.2f} {ldraw_y + y_offset:.2f} {ldraw_z:.2f} {rotation} {brick_type}.dat"
+                        ldraw_lines.append(ldraw_line)
+                        brick_count += 1
 
         return brick_count
 
@@ -1130,7 +1266,7 @@ class MinecraftToLegoConverter:
         except Exception as e:
             print(f"Error saving LDraw file: {e}")
 
-    def convert_file(self, input_path: str, output_path: str = None, optimize: bool = False) -> bool:
+    def convert_file(self, input_path: str, output_path: str = None, optimize: bool = False, scale: int = 1) -> bool:
         """
         Convert a single Minecraft schematic file to LDraw
 
@@ -1138,6 +1274,7 @@ class MinecraftToLegoConverter:
             input_path: Path to input schematic file
             output_path: Path to output LDraw file (auto-generated if None)
             optimize: If True, merge adjacent same-color blocks into larger bricks
+            scale: Scale factor (1 = 1 stud per block, 2 = 2 studs per block)
 
         Returns:
             True if conversion successful, False otherwise
@@ -1157,7 +1294,7 @@ class MinecraftToLegoConverter:
             return False
 
         # Convert to LDraw
-        ldraw_content = self.convert_to_ldraw(schematic, optimize=optimize)
+        ldraw_content = self.convert_to_ldraw(schematic, optimize=optimize, scale=scale)
 
         # Save LDraw file
         self.save_ldraw_file(ldraw_content, output_path)
@@ -1170,6 +1307,9 @@ def main():
     parser.add_argument("input", help="Input Minecraft schematic file (.schematic)")
     parser.add_argument("-o", "--output", help="Output LDraw file (.ldr)")
     parser.add_argument("-v", "--verbose", action="store_true", help="Verbose output")
+    parser.add_argument("--scale", type=int, choices=[1, 2], default=1,
+                        help="Scale factor: 1 = 1 stud/block (default), 2 = 2 studs/block "
+                             "(stairs become L-shaped steps, slabs are exact half-height)")
 
     args = parser.parse_args()
 
@@ -1178,8 +1318,10 @@ def main():
     if args.verbose:
         print("Minecraft to Lego Converter")
         print("===========================")
+        if args.scale > 1:
+            print(f"Scale: {args.scale}x")
 
-    success = converter.convert_file(args.input, args.output)
+    success = converter.convert_file(args.input, args.output, scale=args.scale)
 
     if success:
         print("Conversion completed successfully!")

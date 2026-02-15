@@ -88,47 +88,56 @@ def display_menu(schematic_files):
         print(f"  {i}. {icon} {filename} {info['size_str']}  ({info['modified']})")
 
     print()
-    print("Controls:")
-    print("  • Enter number to select file (e.g. '1')")
-    print("  • Add '-o' to optimize/merge bricks (e.g. '1 -o')")
-    print("  • 'r' or 'refresh' to reload file list")
-    print("  • 'q' or 'quit' to exit")
+    print("Options:")
+    print("  Enter a number to convert (e.g. '2')")
+    print()
+    print("  Flags (add after number):")
+    print("    -o   Optimize: merge adjacent same-color blocks into")
+    print("         larger bricks (2x2, 2x4, etc). Fewer parts, faster render.")
+    print("         Without -o: every block becomes a single 1x1 brick.")
+    print("    -2x  2x scale: each Minecraft block = 2 LEGO studs.")
+    print("         Stairs become real L-shaped steps, slabs are exact half-height.")
+    print("         Without -2x: 1 stud per block (smaller but less detail).")
+    print()
+    print("  Examples: '2'  '2 -o'  '2 -2x'  '2 -o -2x'")
+    print("  Type 'q' to quit, 'r' to refresh file list")
     print()
 
     return schematic_files
 
 def get_user_choice(max_choice):
-    """Get user input for file selection, returns (choice, optimize_flag)"""
+    """Get user input for file selection, returns (choice, optimize_flag, scale)"""
     while True:
         try:
             raw_input = input("Select file (1-{}): ".format(max_choice)).strip()
             choice = raw_input.lower()
 
             if choice in ['q', 'quit']:
-                return 'quit', False
+                return 'quit', False, 1
             elif choice in ['r', 'refresh']:
-                return 'refresh', False
+                return 'refresh', False, 1
 
-            # Check for -o optimize flag
+            # Check for flags
             optimize = '-o' in choice
-            # Remove the -o flag to get the number
-            num_str = choice.replace('-o', '').replace('-0', '').strip()
+            scale = 2 if '-2x' in choice else 1
+            # Remove flags to get the number
+            num_str = choice.replace('-2x', '').replace('-o', '').replace('-0', '').strip()
 
             if num_str.isdigit():
                 num = int(num_str)
                 if 1 <= num <= max_choice:
-                    return num, optimize
+                    return num, optimize, scale
                 else:
-                    print(f"❌ Please enter a number between 1 and {max_choice}")
+                    print(f"Please enter a number between 1 and {max_choice}")
             else:
-                print("❌ Please enter a number, 'q' to quit, or 'r' to refresh")
-                print("   Add '-o' after number to optimize (e.g. '1 -o')")
+                print("Please enter a number, 'q' to quit, or 'r' to refresh")
+                print("   Add '-o' to optimize, '-2x' for 2x scale (e.g. '1 -o -2x')")
 
         except KeyboardInterrupt:
-            print("\n👋 Goodbye!")
+            print("\nGoodbye!")
             sys.exit(0)
         except EOFError:
-            print("\n👋 Goodbye!")
+            print("\nGoodbye!")
             sys.exit(0)
 
 def get_output_filename(input_filename):
@@ -153,31 +162,33 @@ def get_output_filename(input_filename):
         else:
             return os.path.join(models_dir, f"{choice}.ldr")
 
-def show_conversion_progress(converter, schematic_file, output_file, optimize=False):
+def show_conversion_progress(converter, schematic_file, output_file, optimize=False, scale=1):
     """Show conversion progress with animation"""
-    print(f"\n🔄 Converting '{schematic_file}' to Lego...")
+    print(f"\nConverting '{schematic_file}' to Lego...")
     if optimize:
-        print("🔧 OPTIMIZATION ENABLED - will merge into larger bricks")
+        print("OPTIMIZATION ENABLED - will merge into larger bricks")
+    if scale > 1:
+        print(f"SCALE: {scale}x (each MC block = {scale} studs, better stairs/slabs)")
     print("=" * 50)
 
     # Load schematic
-    print("📂 Loading schematic file...")
+    print("Loading schematic file...")
     schematic = converter.load_schematic(schematic_file)
 
     if not schematic:
-        print("❌ Failed to load schematic file!")
+        print("Failed to load schematic file!")
         return False
 
     width, height, length = schematic['width'], schematic['height'], schematic['length']
     total_blocks = width * height * length
 
-    print(f"✅ Loaded {width}x{height}x{length} schematic ({total_blocks} blocks)")
+    print(f"Loaded {width}x{height}x{length} schematic ({total_blocks} blocks)")
 
     # Convert to LDraw
-    print("🔧 Converting blocks to Lego bricks...")
+    print("Converting blocks to Lego bricks...")
     start_time = time.time()
 
-    ldraw_content = converter.convert_to_ldraw(schematic, optimize=optimize)
+    ldraw_content = converter.convert_to_ldraw(schematic, optimize=optimize, scale=scale)
 
     # Count bricks
     brick_lines = [line for line in ldraw_content.split('\n') if line.strip() and not line.startswith('0')]
@@ -186,13 +197,13 @@ def show_conversion_progress(converter, schematic_file, output_file, optimize=Fa
     conversion_time = time.time() - start_time
 
     # Save file
-    print(f"💾 Saving to '{output_file}'...")
+    print(f"Saving to '{output_file}'...")
     converter.save_ldraw_file(ldraw_content, output_file)
 
-    print("✅ Conversion complete!")
-    print(f"   📦 {brick_count} Lego bricks created")
-    print(f"   ⏱️  Conversion time: {conversion_time:.2f}s")
-    print(f"   📄 Output: {output_file}")
+    print("Conversion complete!")
+    print(f"   {brick_count} Lego bricks created")
+    print(f"   Conversion time: {conversion_time:.2f}s")
+    print(f"   Output: {output_file}")
 
     return True
 
@@ -232,11 +243,11 @@ def main():
         if result is None:
             continue  # No files found, user pressed enter to refresh
 
-        # Get user choice (returns tuple: choice, optimize_flag)
-        choice, optimize = get_user_choice(len(schematic_files))
+        # Get user choice (returns tuple: choice, optimize_flag, scale)
+        choice, optimize, scale = get_user_choice(len(schematic_files))
 
         if choice == 'quit':
-            print("👋 Goodbye!")
+            print("Goodbye!")
             return
         elif choice == 'refresh':
             continue  # Reload file list
@@ -249,13 +260,13 @@ def main():
 
         # Check if output exists
         if os.path.exists(output_file):
-            overwrite = input(f"⚠️  '{output_file}' already exists. Overwrite? (y/N): ").strip().lower()
+            overwrite = input(f"'{output_file}' already exists. Overwrite? (y/N): ").strip().lower()
             if overwrite not in ['y', 'yes']:
                 continue
 
         # Convert file
         converter = MinecraftToLegoConverter()
-        success = show_conversion_progress(converter, selected_file, output_file, optimize)
+        success = show_conversion_progress(converter, selected_file, output_file, optimize, scale)
 
         if success:
             # Open in LeoCAD

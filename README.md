@@ -32,9 +32,10 @@ The conversion pipeline has three stages:
 2. **Convert** — Maps each Minecraft block to a LEGO brick:
    - Every block becomes a 1x1 LEGO brick (`3005.dat`) for accurate 1:1 conversion
    - 200+ block types mapped to correct LDraw colors (stone, wood, wool, concrete, terracotta, glass, ores, etc.)
-   - Stairs become slope bricks (`3039.dat`) with correct rotation based on facing direction
-   - Slabs and carpets become plates (`3024.dat`) positioned at top or bottom
-   - **Optimization mode** merges adjacent same-color blocks into larger bricks (1x2 through 2x8) for fewer parts
+   - Stairs become cheese slope bricks (`54200.dat`) with correct rotation, including inverted/ceiling stairs
+   - Slabs and carpets become plates (`3024.dat`) positioned at top or bottom; double slabs become full bricks
+   - **Optimization mode** (`-o`) merges adjacent same-color blocks into larger bricks (1x2 through 2x8) for fewer parts
+   - **2x scale mode** (`-2x`) for more accurate Minecraft geometry — see below
 
 3. **Output** — Writes standard LDraw `.ldr` files compatible with LeoCAD, LDView, LDCad, and other LEGO CAD software.
 
@@ -53,6 +54,11 @@ This launches a console GUI that:
 - Shows conversion progress with brick counts
 - Optionally opens the result in LeoCAD
 
+**Flags** (add after the file number):
+- `-o` — Optimize: merge adjacent same-color 1x1 bricks into larger ones (fewer parts)
+- `-2x` — 2x scale: more accurate Minecraft geometry (see [2x Scale Mode](#2x-scale-mode--more-accurate-minecraft-geometry))
+- Combine: `2 -o -2x`
+
 ### Command Line
 
 ```bash
@@ -62,8 +68,11 @@ python minecraft_to_lego_converter.py schematics/your_file.schematic
 # Specify output file
 python minecraft_to_lego_converter.py schematics/input.schematic -o models/output.ldr
 
-# Verbose output
-python minecraft_to_lego_converter.py schematics/input.schem -v
+# 2x scale for accurate stairs and slabs
+python minecraft_to_lego_converter.py schematics/input.schem --scale 2
+
+# 2x scale + verbose
+python minecraft_to_lego_converter.py schematics/input.schem --scale 2 -v
 ```
 
 ### Python API
@@ -78,7 +87,44 @@ converter.convert_file("schematics/my_build.schematic", "models/my_build.ldr")
 
 # Optimized conversion (merged bricks, fewer parts)
 converter.convert_file("schematics/my_build.schem", "models/my_build.ldr", optimize=True)
+
+# 2x scale (accurate stairs/slabs, can combine with optimize=True)
+converter.convert_file("schematics/my_build.schem", "models/my_build.ldr", scale=2, optimize=True)
 ```
+
+## 2x Scale Mode — More Accurate Minecraft Geometry
+
+The default 1:1 conversion maps each Minecraft block to a single 1x1 LEGO brick. This works well for full cubes (stone, wood, wool), but Minecraft has sub-block shapes — stairs, slabs, carpet — that don't have a perfect LEGO equivalent at 1-stud scale.
+
+**2x scale** solves this by making each Minecraft block **2 studs wide × 2 bricks tall** (40×48×40 LDU). This gives enough room to accurately represent non-cube geometry:
+
+| Block Type | 1x scale (default) | 2x scale (`-2x`) |
+|------------|--------------------|--------------------|
+| **Stairs** | Cheese slope — angled approximation, no step shape | **L-shaped step**: full 2×2 brick on bottom + 1×2 brick on the tall side. Actual step geometry matching Minecraft |
+| **Inverted stairs** | Not supported (rendered same as normal stairs) | **Correctly flipped**: full brick on top layer, step on bottom, matching Minecraft ceiling stairs |
+| **Slabs** | Plate (8 LDU = 1/3 brick height) — wrong ratio, slabs should be 1/2 | **Single 2×2 brick = exactly half** the 2-brick block height. Perfect 1/2 ratio |
+| **Carpet** | Plate (oversized relative to block) | **2×2 plate** at correct floor level within the block space |
+| **Full blocks** | 1×1 brick | Two stacked 2×2 bricks (fills the full 2-brick height) |
+
+**When to use 2x:** Any build with stairs, slabs, or carpet — especially detailed architecture like Kismet where stairs define the shape. The resulting model is larger (2× in each dimension) but geometrically faithful to the Minecraft original.
+
+**When 1x is fine:** Pixel-art walls, flat structures, or builds made entirely of full cubes.
+
+### How it works at 2x scale
+
+A Minecraft stair block (e.g. `oak_stairs[facing=north,half=bottom]`) becomes two LEGO bricks arranged in an L-shape:
+
+```
+     ┌─────┐
+     │3004 │  ← 1×2 brick (rotated), only on the tall side
+     │     │
+┌────┴─────┤
+│  3003    │  ← 2×2 brick, full footprint
+│          │
+└──────────┘
+```
+
+The `facing` direction determines which side gets the upper brick, and `half=top` (inverted/ceiling stairs) flips the layers. This matches how Minecraft stairs actually look — an L-shaped step, not a slope.
 
 ## Setting Up on a New System
 
@@ -147,7 +193,7 @@ The converter handles 200+ Minecraft block types including:
 - All wood types (oak, spruce, birch, jungle, acacia, dark oak, mangrove, cherry, bamboo, crimson, warped)
 - All wool, carpet, concrete, and terracotta colors (16 each)
 - All stained glass and glass pane colors (transparent)
-- Stairs (with directional rotation) and slabs (top/bottom positioning)
+- Stairs (directional rotation + inverted/ceiling stairs) and slabs (top/bottom/double)
 - Ores, minerals, and metal blocks
 - Nether blocks, End blocks, deepslate variants
 - Stone types (granite, diorite, andesite + polished variants)
