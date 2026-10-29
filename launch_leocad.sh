@@ -3,6 +3,24 @@
 # LeoCAD Launcher Script - opens .ldr files in LeoCAD for 3D viewing/editing
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+
+# macOS uses the LeoCAD application. The Linux AppImage below cannot run on a Mac.
+if [ "$(uname)" = "Darwin" ]; then
+    LEOCAD_APP="/Applications/LeoCAD.app"
+    if [ ! -d "$LEOCAD_APP" ]; then
+        echo "LeoCAD not found at: $LEOCAD_APP"
+        echo "Download from: https://www.leocad.org/download.html"
+        exit 1
+    fi
+    echo "Launching LeoCAD..."
+    if [ $# -eq 0 ]; then
+        open -a "$LEOCAD_APP"
+    else
+        open -a "$LEOCAD_APP" "$@"
+    fi
+    exit 0
+fi
+
 LEOCAD_PATH="$SCRIPT_DIR/LeoCAD-Linux-25.09-x86_64.AppImage"
 
 # Check if LeoCAD exists

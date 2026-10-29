@@ -12,6 +12,8 @@ Created: 2026-01-04
 import os
 import sys
 import argparse
+import math
+import struct
 import numpy as np
 from typing import Dict, List, Tuple, Optional
 import nbtlib  # For parsing Minecraft NBT files
@@ -668,14 +670,12 @@ class MinecraftToLegoConverter:
         
         # Check for STAIRS FIRST (before slab check)
         if "stairs" in base_name or "stair" in base_name:
-            # Debug: print first few stair block names detected
-            if not hasattr(self, '_stair_debug_count'):
-                self._stair_debug_count = 0
-            if self._stair_debug_count < 5:
-                print(f"   DEBUG: Stair detected: {block_name}")
-                self._stair_debug_count += 1
             facing = props.get("facing", "north")
             half = props.get("half", "bottom")
+            # shape is straight / inner_left / inner_right / outer_left / outer_right.
+            # WorldEdit stores it when the schematic was saved. If it is missing,
+            # build_parts fills it in from the neighboring stairs.
+            shape = props.get("shape", "")
             rotation = self.rotations.get(facing, self.rotations["north"])
             y_offset = 0
             if half == "top":
@@ -688,16 +688,11 @@ class MinecraftToLegoConverter:
                 "type": "stair",
                 "facing": facing,
                 "half": half,
+                "shape": shape,
             }
         
         # Check if this is a slab
         if "slab" in base_name:
-            # Debug: print first few slab block names detected
-            if not hasattr(self, '_slab_debug_count'):
-                self._slab_debug_count = 0
-            if self._slab_debug_count < 5:
-                print(f"   DEBUG: Slab detected: {block_name} (type={props.get('type', 'bottom')})")
-                self._slab_debug_count += 1
             slab_type = props.get("type", "bottom")
             # Double slab = full block, treat as regular brick
             if slab_type == "double":
@@ -966,9 +961,998 @@ class MinecraftToLegoConverter:
 
         return brick_type, color_id
 
+    # Real brick lengths, in studs. Scale 2 places these as 2-stud-wide parts
+    # (one Minecraft block is 2 studs), so a run is measured in blocks there.
+    _RUN_LEN_1X = (1, 2, 3, 4, 6, 8)
+    _PART_1X = {1: "3005", 2: "3004", 3: "3622", 4: "3010", 6: "3009", 8: "3008"}
+    _RUN_LEN_2X = (1, 2, 3, 4)  # blocks; each block is 2 studs, parts are 2x2 .. 2x8
+    _PART_2X = {1: "3003", 2: "3001", 3: "2456", 4: "3007"}
+    # Old schematic ids. Data: bits 0-1 facing (E,W,S,N), bit 2 = upside down.
+    _OLD_STAIR_IDS = {53, 67, 108, 109, 114, 128, 134, 135, 136, 156, 163, 164, 180, 203}
+    _OLD_STAIR_FACING = {0: "east", 1: "west", 2: "south", 3: "north"}
+    _OLD_SLAB_IDS = {44, 126, 182, 205}
+
+    def _high_quads(self, facing: str, shape: str):
+        """Which 1-stud quadrants of a 2x2 stair are the HIGH part.
+
+        facing is the full-block side (Minecraft's definition).
+        Viewed from above, north is -Z and west is -X:
+
+            NW NE
+            SW SE
+
+        straight facing north is the north row. inner_* adds the left or right
+        arm (3 quadrants). outer_* keeps only the left or right corner.
+        """
+        facing = facing if facing in ("north", "south", "east", "west") else "north"
+        straight = {
+            "north": {"NW", "NE"},
+            "south": {"SW", "SE"},
+            "east": {"NE", "SE"},
+            "west": {"NW", "SW"},
+        }[facing]
+        left = {"north": "west", "west": "south", "south": "east", "east": "north"}
+        right = {"north": "east", "east": "south", "south": "west", "west": "north"}
+        opp = {"north": "south", "south": "north", "east": "west", "west": "east"}
+        corner = {
+            frozenset(("north", "west")): "NW",
+            frozenset(("north", "east")): "NE",
+            frozenset(("south", "west")): "SW",
+            frozenset(("south", "east")): "SE",
+        }
+        if shape == "inner_left":
+            return set(straight) | {corner[frozenset((left[facing], opp[facing]))]}
+        if shape == "inner_right":
+            return set(straight) | {corner[frozenset((right[facing], opp[facing]))]}
+        if shape == "outer_left":
+            return {corner[frozenset((facing, left[facing]))]}
+        if shape == "outer_right":
+            return {corner[frozenset((facing, right[facing]))]}
+        return set(straight)
+
+    def _infer_stair_shape(self, facing, half, x, y, z, stair_at, width, length):
+        """Minecraft's stair corner rule, used when a schematic has no shape= property.
+
+        Same test as StairBlock: a stair on the full-block side that faces across
+        us is an outer corner; a stair on the low side that faces across us is
+        an inner corner. Left/right follow rotateYCounterclockwise.
+        """
+        opp = {"north": "south", "south": "north", "east": "west", "west": "east"}
+        ccw = {"north": "west", "west": "south", "south": "east", "east": "north"}
+        step = {"north": (0, -1), "south": (0, 1), "east": (1, 0), "west": (-1, 0)}
+
+        def other(direction):
+            dx, dz = step[direction]
+            nx, nz = x + dx, z + dz
+            if not (0 <= nx < width and 0 <= nz < length):
+                return None
+            return stair_at.get((y, nz, nx))
+
+        def different(direction):
+            found = other(direction)
+            return found is None or found[0] != facing or found[1] != half
+
+        def other_axis(a, b):
+            return (a in ("north", "south")) != (b in ("north", "south"))
+
+        neighbor = other(facing)
+        if neighbor and neighbor[1] == half and other_axis(neighbor[0], facing):
+            if different(opp[neighbor[0]]):
+                return "outer_left" if neighbor[0] == ccw[facing] else "outer_right"
+        neighbor = other(opp[facing])
+        if neighbor and neighbor[1] == half and other_axis(neighbor[0], facing):
+            if different(neighbor[0]):
+                return "inner_left" if neighbor[0] == ccw[facing] else "inner_right"
+        return "straight"
+
+    def _quad_parts(self, quads, facing, use_slope):
+        """Turn a set of quadrants into 1x1 / 1x2 bricks, or one slope.
+
+        A straight stair with nothing stacked on it uses slope 3040 (2x1),
+        high edge on the full-block side, sloping down toward the step.
+        Corners and anything that must hold a brick above stay flat bricks,
+        because a slope has no studs on top.
+        """
+        pair = {
+            "N": ({"NW", "NE"}, (0, -10), "north"),
+            "S": ({"SW", "SE"}, (0, 10), "south"),
+            "E": ({"NE", "SE"}, (10, 0), "east"),
+            "W": ({"NW", "SW"}, (-10, 0), "west"),
+        }
+        shift_1 = {"NW": (-10, -10), "NE": (10, -10), "SW": (-10, 10), "SE": (10, 10)}
+        rot_id = (1, 0, 0, 0, 1, 0, 0, 0, 1)
+        # 3040 slopes down toward local +Z. Point that at the low side.
+        slope_rot = {
+            "south": rot_id,
+            "north": (-1, 0, 0, 0, 1, 0, 0, 0, -1),
+            "west": (0, 0, -1, 0, 1, 0, 1, 0, 0),
+            "east": (0, 0, 1, 0, 1, 0, -1, 0, 0),
+        }
+        # 3004 is 2 studs along local X. Turn that along Z for the east/west pairs.
+        rot_to_z = (0, 0, -1, 0, 1, 0, 1, 0, 0)
+        opp = {"north": "south", "south": "north", "east": "west", "west": "east"}
+        quads = set(quads)
+        prefer = {"north": "N", "south": "S", "east": "E", "west": "W"}.get(facing, "N")
+        order = [prefer] + [k for k in ("N", "S", "E", "W") if k != prefer]
+
+        if use_slope and len(quads) == 2:
+            qs, shift, high = pair[prefer]
+            if quads == qs:
+                low = opp[high]
+                return [{
+                    "part": "3040", "shift": shift, "rot": slope_rot[low],
+                    "sx": 2, "sz": 1, "kind": "slope", "slope_low": low,
+                    "quads": set(qs), "high": high,
+                }]
+
+        out = []
+        remaining = set(quads)
+        for key in order:
+            qs, shift, _high = pair[key]
+            if qs <= remaining and len(qs) == 2:
+                along_x = key in ("N", "S")
+                out.append({
+                    "part": "3004", "shift": shift,
+                    "rot": rot_id if along_x else rot_to_z,
+                    "sx": 2 if along_x else 1, "sz": 1 if along_x else 2,
+                    "kind": "box", "slope_low": None, "quads": set(qs), "high": None,
+                })
+                remaining -= qs
+        for q in sorted(remaining):
+            out.append({
+                "part": "3005", "shift": shift_1[q], "rot": rot_id,
+                "sx": 1, "sz": 1, "kind": "box", "slope_low": None,
+                "quads": {q}, "high": None,
+            })
+        return out
+
+    def _cover_layer(self, color, supported, scale, optimize):
+        """Brick one horizontal layer.
+
+        LEGO bricks do not clutch to the brick beside them, only to studs
+        below. A block with air underneath is buildable only when it is part
+        of a longer brick that also covers a supported block. Each piece is a
+        real length (1, 2, 3, 4, 6, or 8 studs; at 2x, 1 to 4 blocks).
+        """
+        length, width = color.shape
+        lengths = self._RUN_LEN_2X if scale == 2 else self._RUN_LEN_1X
+        used = np.zeros_like(color, dtype=bool)
+
+        def inside(z, x):
+            return 0 <= z < length and 0 <= x < width
+
+        def same(z, x, c):
+            return inside(z, x) and int(color[z, x]) == c
+
+        bricks = []
+
+        def commit(cells, floating, anchored):
+            xs = [x for _z, x in cells]
+            zs = [z for z, _x in cells]
+            bricks.append({
+                "cells": cells,
+                "color": int(color[cells[0][0], cells[0][1]]),
+                "floating": floating,
+                "anchored": anchored,
+                "x": min(xs), "z": min(zs),
+                "dx": max(xs) - min(xs) + 1,
+                "dz": max(zs) - min(zs) + 1,
+                "along": "z" if max(xs) == min(xs) and max(zs) != min(zs) else "x",
+            })
+            for z, x in cells:
+                used[z, x] = True
+
+        unsupported = []
+        for z in range(length):
+            for x in range(width):
+                if int(color[z, x]) < 0 or supported[z, x]:
+                    continue
+                best = 99
+                c = int(color[z, x])
+                for dz, dx in ((1, 0), (-1, 0), (0, 1), (0, -1)):
+                    cz, cx = z, x
+                    for step in range(1, 9):
+                        cz += dz
+                        cx += dx
+                        if not same(cz, cx, c):
+                            break
+                        if supported[cz, cx] and not used[cz, cx]:
+                            best = min(best, step)
+                            break
+                unsupported.append((best, z, x))
+        # Farther overhangs first, so a long brick is reserved for them
+        # instead of a nearer block using up the anchor.
+        unsupported.sort(key=lambda item: (-item[0], item[1], item[2]))
+
+        for _dist, z, x in unsupported:
+            if used[z, x] or int(color[z, x]) < 0:
+                continue
+            c = int(color[z, x])
+            best = None
+            for axis in ("x", "z"):
+                dirs = ((0, 1), (0, -1)) if axis == "x" else ((1, 0), (-1, 0))
+                neg = []
+                cz, cx = z + dirs[1][0], x + dirs[1][1]
+                while same(cz, cx, c) and not used[cz, cx]:
+                    neg.append((cz, cx))
+                    cz += dirs[1][0]
+                    cx += dirs[1][1]
+                line = list(reversed(neg)) + [(z, x)]
+                cz, cx = z + dirs[0][0], x + dirs[0][1]
+                while same(cz, cx, c) and not used[cz, cx]:
+                    line.append((cz, cx))
+                    cz += dirs[0][0]
+                    cx += dirs[0][1]
+                idx = len(neg)
+                n = len(line)
+                for L in lengths:
+                    if L > n:
+                        continue
+                    for start in range(0, n - L + 1):
+                        if not (start <= idx < start + L):
+                            continue
+                        window = line[start:start + L]
+                        n_sup = sum(1 for cz, cx in window if supported[cz, cx])
+                        if n_sup < 1:
+                            continue
+                        n_over = L - n_sup
+                        # Cover as many loose blocks as this brick can, then prefer the shorter piece.
+                        rank = (n_over, -L)
+                        if best is None or rank > best[0]:
+                            best = (rank, window)
+            if best is None:
+                continue
+            window = best[1]
+            n_sup = sum(1 for cz, cx in window if supported[cz, cx])
+            commit(window, floating=False, anchored=n_sup < len(window))
+
+        def greedy(only_floating):
+            for z in range(length):
+                x = 0
+                while x < width:
+                    if used[z, x] or int(color[z, x]) < 0:
+                        x += 1
+                        continue
+                    if bool(supported[z, x]) == only_floating:
+                        x += 1
+                        continue
+                    c = int(color[z, x])
+                    run = []
+                    while x + len(run) < width and not used[z, x + len(run)] and int(color[z, x + len(run)]) == c:
+                        if bool(supported[z, x + len(run)]) == only_floating:
+                            break
+                        run.append((z, x + len(run)))
+                    if not run:
+                        x += 1
+                        continue
+                    left = run
+                    while left:
+                        take = 1
+                        for L in sorted(lengths, reverse=True):
+                            if L <= len(left):
+                                take = L
+                                break
+                        commit(left[:take], floating=only_floating, anchored=False)
+                        left = left[take:]
+
+        greedy(only_floating=True)
+        if optimize or scale == 2:
+            # 2x already uses a 2x2 brick per block; merging just makes longer ones.
+            # At 1x, merging is the Optimize option.
+            if optimize:
+                greedy(only_floating=False)
+            else:
+                for z in range(length):
+                    for x in range(width):
+                        if not used[z, x] and int(color[z, x]) >= 0:
+                            commit([(z, x)], floating=False, anchored=False)
+        else:
+            for z in range(length):
+                for x in range(width):
+                    if not used[z, x] and int(color[z, x]) >= 0:
+                        commit([(z, x)], floating=False, anchored=False)
+
+        if optimize and scale == 1:
+            bricks = self._pair_bricks(bricks)
+        return bricks
+
+    def _pair_bricks(self, bricks):
+        """Join two identical side-by-side runs into one 2-wide brick."""
+        buckets = {}
+        for i, b in enumerate(bricks):
+            if b["along"] == "x" and b["dz"] == 1 and not b["floating"]:
+                buckets.setdefault((b["z"], b["x"], b["dx"], b["color"]), []).append(i)
+        used = set()
+        out = []
+        for i, b in enumerate(bricks):
+            if i in used:
+                continue
+            partner = None
+            if b["along"] == "x" and b["dz"] == 1 and not b["floating"]:
+                ids = buckets.get((b["z"] + 1, b["x"], b["dx"], b["color"]), [])
+                for j in ids:
+                    if j not in used and j != i:
+                        partner = j
+                        break
+            if partner is None:
+                out.append(b)
+                continue
+            used.add(i)
+            used.add(partner)
+            other = bricks[partner]
+            merged = dict(b)
+            merged["cells"] = b["cells"] + other["cells"]
+            merged["dz"] = 2
+            merged["anchored"] = b["anchored"] or other["anchored"]
+            merged["paired"] = True
+            out.append(merged)
+        return out
+
+    def _lookup_cell(self, schematic_data, x, y, z):
+        """Return (color, special_info or None) for one schematic cell. None color means skip."""
+        blocks = schematic_data["blocks"]
+        width = schematic_data["width"]
+        length = schematic_data["length"]
+        block_id = int(blocks[y, z, x])
+        if block_id == 0:
+            return None, None
+        names = schematic_data.get("block_names")
+        if names:
+            index = y * length * width + z * width + x
+            if index >= len(names):
+                return None, None
+            block_name = names[index]
+            base = block_name.replace("minecraft:", "")
+            if "[" in base:
+                base = base.split("[")[0]
+            if base == "air" or base.endswith("_air"):
+                return None, None
+            color = self._get_color_from_block_name(block_name)
+            if color < 0 or self._is_skip_block(block_name):
+                return None, None
+            return color, self._get_special_part_info(block_name)
+        data_value = 0
+        if schematic_data.get("data") is not None:
+            index = y * length * width + z * width + x
+            if index < len(schematic_data["data"]):
+                data_value = int(schematic_data["data"][index])
+        _brick, color = self.get_brick_info(block_id, data_value)
+        special = None
+        if block_id in self._OLD_STAIR_IDS:
+            special = {
+                "type": "stair",
+                "facing": self._OLD_STAIR_FACING.get(data_value & 3, "east"),
+                "half": "top" if (data_value & 4) else "bottom",
+                "shape": "",
+            }
+        elif block_id in self._OLD_SLAB_IDS:
+            special = {
+                "type": "slab",
+                "slab_type": "top" if (data_value & 8) else "bottom",
+            }
+        return color, special
+
+    def build_model(self, schematic_data: Dict, optimize: bool = False, scale: int = 1, progress=None) -> Dict:
+        """Plan assemblable LEGO parts and the matching print grid.
+
+        Scale 2 is the one that can show stairs: each block is 2 studs wide
+        and 2 bricks tall. A bottom stair is a full brick on the bottom and
+        either a slope or a flat step on the high half. Overhangs become one
+        brick with the neighbor that holds them up.
+        """
+        def log(msg):
+            print(msg)
+            if progress:
+                progress(msg)
+
+        if scale not in (1, 2):
+            scale = 1
+        width = schematic_data["width"]
+        height = schematic_data["height"]
+        length = schematic_data["length"]
+        log(f"Reading {width}x{height}x{length} blocks")
+
+        # specials[(y,z,x)] = info dict. Missing key = air/skip.
+        # kind is stair / slab / carpet / full.
+        specials = {}
+        colors = {}
+        for y in range(height):
+            for z in range(length):
+                for x in range(width):
+                    color, info = self._lookup_cell(schematic_data, x, y, z)
+                    if color is None:
+                        continue
+                    colors[(y, z, x)] = color
+                    specials[(y, z, x)] = info
+
+        stair_at = {}
+        for (y, z, x), info in specials.items():
+            if info and info.get("type") == "stair":
+                stair_at[(y, z, x)] = (info.get("facing", "north"), info.get("half", "bottom"))
+        for (y, z, x), info in list(specials.items()):
+            if not info or info.get("type") != "stair":
+                continue
+            if not info.get("shape"):
+                info["shape"] = self._infer_stair_shape(
+                    info.get("facing", "north"), info.get("half", "bottom"),
+                    x, y, z, stair_at, width, length)
+
+        lower = np.full((height, length, width), -1, dtype=np.int16)
+        upper = np.full((height, length, width), -1, dtype=np.int16)
+        # True where a partial piece (step, not a full cell) occupies that half.
+        lower_partial = np.zeros((height, length, width), dtype=bool)
+        upper_partial = np.zeros((height, length, width), dtype=bool)
+        touches_above = np.zeros((height, length, width), dtype=bool)
+        partials = []
+        plates = []
+
+        above_cache = {}
+
+        def above_needs_studs(x, y, z):
+            """True when the cell above rests on this cell's top studs."""
+            if y + 1 >= height:
+                return False
+            key = (x, y + 1, z)
+            if key in above_cache:
+                return above_cache[key]
+            info = specials.get((y + 1, z, x))
+            if (y + 1, z, x) not in colors:
+                above_cache[key] = False
+                return False
+            if info is None or info.get("type") == "full":
+                above_cache[key] = True
+                return True
+            if info.get("type") == "slab" and info.get("slab_type") == "top":
+                above_cache[key] = False
+                return False
+            # Stairs, bottom slabs, and carpet all have a piece at the bottom of their cell.
+            above_cache[key] = True
+            return True
+
+        for (y, z, x), color in colors.items():
+            info = specials.get((y, z, x))
+            kind = info.get("type") if info else "full"
+            if scale == 1:
+                # One stud is too small for a step that still clutches. Stairs are
+                # full bricks here so the build holds together. Slabs stay plates.
+                if kind == "slab":
+                    plates.append({
+                        "x": x, "y": y, "z": z, "color": color,
+                        "top": info.get("slab_type") == "top", "carpet": False,
+                    })
+                    if info.get("slab_type") == "top":
+                        touches_above[y, z, x] = True
+                elif kind == "carpet":
+                    plates.append({"x": x, "y": y, "z": z, "color": color, "top": False, "carpet": True})
+                else:
+                    lower[y, z, x] = color
+                    touches_above[y, z, x] = True
+                continue
+
+            # Scale 2. A full block is two bricks. A bottom slab is the lower brick only.
+            if kind == "carpet":
+                plates.append({"x": x, "y": y, "z": z, "color": color, "top": False, "carpet": True})
+                continue
+            if kind == "slab":
+                if info.get("slab_type") == "top":
+                    upper[y, z, x] = color
+                    touches_above[y, z, x] = True
+                else:
+                    lower[y, z, x] = color
+                continue
+            if kind == "stair":
+                facing = info.get("facing", "north")
+                half = info.get("half", "bottom")
+                shape = info.get("shape") or "straight"
+                quads = self._high_quads(facing, shape)
+                use_slope = (
+                    half == "bottom" and shape == "straight"
+                    and not above_needs_studs(x, y, z)
+                )
+                pieces = self._quad_parts(quads, facing, use_slope)
+                if half == "bottom":
+                    lower[y, z, x] = color
+                    upper_partial[y, z, x] = True
+                    touches_above[y, z, x] = True
+                    for piece in pieces:
+                        piece.update({"x": x, "y": y, "z": z, "color": color, "sub": "upper"})
+                        partials.append(piece)
+                else:
+                    upper[y, z, x] = color
+                    lower_partial[y, z, x] = True
+                    touches_above[y, z, x] = True
+                    # Upside-down: flat bricks on the bottom so the full brick can sit on them.
+                    for piece in self._quad_parts(quads, facing, False):
+                        piece.update({"x": x, "y": y, "z": z, "color": color, "sub": "lower"})
+                        partials.append(piece)
+                continue
+            lower[y, z, x] = color
+            upper[y, z, x] = color
+            touches_above[y, z, x] = True
+
+        # A column's lowest block sits on a baseplate, unless it is a lip
+        # sticking out from a taller neighbor. Those lips are overhangs and
+        # have to be part of a brick that reaches back to the wall.
+        has_mass = (lower >= 0) | (upper >= 0) | lower_partial | upper_partial
+        for plate in plates:
+            has_mass[plate["y"], plate["z"], plate["x"]] = True
+        lowest = np.full((length, width), -1, dtype=np.int16)
+        for y in range(height):
+            found = has_mass[y] & (lowest < 0)
+            lowest[found] = y
+        overhang = np.zeros((height, length, width), dtype=bool)
+        seeds = []
+        for z in range(length):
+            for x in range(width):
+                y = int(lowest[z, x])
+                if y < 0:
+                    continue
+                for dz, dx in ((1, 0), (-1, 0), (0, 1), (0, -1)):
+                    nz, nx = z + dz, x + dx
+                    if 0 <= nz < length and 0 <= nx < width and 0 <= int(lowest[nz, nx]) < y:
+                        overhang[y, z, x] = True
+                        seeds.append((y, z, x))
+                        break
+        stack = seeds
+        while stack:
+            y, z, x = stack.pop()
+            for dz, dx in ((1, 0), (-1, 0), (0, 1), (0, -1)):
+                nz, nx = z + dz, x + dx
+                if not (0 <= nz < length and 0 <= nx < width):
+                    continue
+                if int(lowest[nz, nx]) == y and not overhang[y, nz, nx]:
+                    overhang[y, nz, nx] = True
+                    stack.append((y, nz, nx))
+
+        def on_foundation(y, z, x):
+            return int(lowest[z, x]) == y and not overhang[y, z, x]
+
+        log("Placing bricks so overhangs stay attached")
+        parts = []
+        anchored = 0
+        floating = 0
+
+        def add_brick(spec, y, sub):
+            nonlocal anchored, floating
+            if spec["anchored"]:
+                anchored += 1
+            if spec["floating"]:
+                floating += 1
+            cells = spec["cells"]
+            cx = sum(x for _z, x in cells) / len(cells)
+            cz = sum(z for z, _x in cells) / len(cells)
+            stud = 20 * scale
+            lx = (cx - width / 2.0) * stud
+            lz = (cz - length / 2.0) * stud
+            ly = -y * (24 * scale)
+            if scale == 2 and sub == "lower":
+                ly += 24
+            n = spec["dx"] if spec["along"] == "x" else spec["dz"]
+            rot = (1, 0, 0, 0, 1, 0, 0, 0, 1)
+            rot_to_z = (0, 0, -1, 0, 1, 0, 1, 0, 0)
+            if scale == 2:
+                part = self._PART_2X[n]
+                if spec["along"] == "z":
+                    rot = rot_to_z
+            elif spec.get("paired") and spec["dx"] == 1:
+                part = "3004"
+                rot = rot_to_z
+            elif spec.get("paired"):
+                part = self.brick_sizes[(2, spec["dx"])]
+            else:
+                part = self._PART_1X[n]
+                if spec["along"] == "z":
+                    rot = rot_to_z
+            parts.append({
+                "part": part, "color": spec["color"], "x": lx, "y": ly, "z": lz,
+                "rot": rot, "kind": "box", "sub": sub, "y_mc": y,
+                "cells": [(y, z, x) for z, x in cells],
+                "floating": spec["floating"], "anchored": spec["anchored"],
+                "h_ldu": 24,
+            })
+
+        for y in range(height):
+            lower_sup = np.zeros((length, width), dtype=bool)
+            upper_sup = np.zeros((length, width), dtype=bool)
+            for z in range(length):
+                for x in range(width):
+                    held_from_below = y > 0 and bool(touches_above[y - 1, z, x])
+                    if int(lower[y, z, x]) >= 0:
+                        lower_sup[z, x] = on_foundation(y, z, x) or held_from_below
+                    if int(upper[y, z, x]) >= 0:
+                        # The upper brick clutches to the lower brick of the same block.
+                        upper_sup[z, x] = int(lower[y, z, x]) >= 0 or bool(lower_partial[y, z, x])
+            if scale == 1:
+                for spec in self._cover_layer(lower[y], lower_sup, scale, optimize):
+                    add_brick(spec, y, "full")
+            else:
+                for spec in self._cover_layer(lower[y], lower_sup, scale, optimize):
+                    add_brick(spec, y, "lower")
+                for spec in self._cover_layer(upper[y], upper_sup, scale, optimize):
+                    add_brick(spec, y, "upper")
+
+        for piece in partials:
+            y, x, z = piece["y"], piece["x"], piece["z"]
+            if piece["sub"] == "upper":
+                held = int(lower[y, z, x]) >= 0 or bool(lower_partial[y, z, x])
+            else:
+                held = on_foundation(y, z, x) or (y > 0 and bool(touches_above[y - 1, z, x]))
+            if not held:
+                floating += 1
+            stud = 20 * scale
+            lx = (x - width / 2.0) * stud + piece["shift"][0]
+            lz = (z - length / 2.0) * stud + piece["shift"][1]
+            ly = -y * (24 * scale)
+            if piece["sub"] == "lower":
+                ly += 24
+            parts.append({
+                "part": piece["part"], "color": piece["color"],
+                "x": lx, "y": ly, "z": lz, "rot": piece["rot"],
+                "kind": piece["kind"], "sub": piece["sub"], "y_mc": y,
+                "cells": [(y, z, x)], "floating": not held, "anchored": False,
+                "h_ldu": 24, "quads": piece["quads"], "high": piece.get("high"),
+                "sx": piece["sx"], "sz": piece["sz"],
+            })
+
+        for plate in plates:
+            x, y, z = plate["x"], plate["y"], plate["z"]
+            held = on_foundation(y, z, x) or (y > 0 and bool(touches_above[y - 1, z, x]))
+            # A top plate sits in the top of the cell, so it does not reach a brick below.
+            if plate["top"]:
+                held = False
+            if not held:
+                floating += 1
+            stud = 20 * scale
+            lx = (x - width / 2.0) * stud
+            lz = (z - length / 2.0) * stud
+            ly = -y * (24 * scale)
+            if scale == 1:
+                ly += 0 if plate["top"] else 16
+                part = "3024"
+            else:
+                # 2x2 plate at the bottom of the 2-brick cell.
+                ly += 40
+                part = "3022"
+            parts.append({
+                "part": part, "color": plate["color"], "x": lx, "y": ly, "z": lz,
+                "rot": (1, 0, 0, 0, 1, 0, 0, 0, 1), "kind": "plate",
+                "sub": "plate", "y_mc": y, "cells": [(y, z, x)],
+                "floating": not held, "anchored": False, "h_ldu": 8,
+                "plate_top": plate["top"],
+            })
+
+        warnings = []
+        if anchored:
+            warnings.append(
+                f"{anchored} overhanging bricks were joined to a neighbor that holds them up, so they can be snapped on."
+            )
+        if floating:
+            warnings.append(
+                f"{floating} pieces have nothing to attach to. They are still in the model, as their own loose pieces."
+            )
+        n_slope = sum(1 for p in parts if p["part"] == "3040")
+        n_stair_bits = sum(1 for p in parts if p.get("quads"))
+        for line in warnings:
+            log(line)
+        log(f"{len(parts)} LEGO pieces, {n_slope} slope bricks, {n_stair_bits} stair pieces")
+
+        ldraw = self._parts_to_ldraw(parts, scale, optimize, warnings)
+        plates_per = 3 * scale
+        solid = np.zeros((height * plates_per, length * scale, width * scale), dtype=bool)
+        nostud = set()
+        wedges = []
+        self._fill_print_grid(parts, solid, nostud, wedges, scale)
+        return {
+            "parts": parts,
+            "ldraw": ldraw,
+            "warnings": warnings,
+            "solid": solid,
+            "nostud": nostud,
+            "wedges": wedges,
+            "scale": scale,
+            "stats": {
+                "bricks": len(parts),
+                "anchored": anchored,
+                "floating": floating,
+                "slopes": n_slope,
+            },
+        }
+
+    def _parts_to_ldraw(self, parts, scale, optimize, warnings) -> str:
+        lines = [
+            "0 Jonathan Rothberg's MineCraft to LEGO converter",
+            "0 Name: Converted from Minecraft",
+            "0 Author: Jonathan Rothberg",
+        ]
+        if optimize:
+            lines.append("0 Optimized: Yes (merged bricks)")
+        if scale > 1:
+            lines.append(f"0 Scale: {scale}x (each MC block = {scale} studs and {scale} bricks tall)")
+        lines.append("0 Stairs: stepped bricks; open straight stairs use slope 3040")
+        lines.append("0 Overhangs: one brick with the neighbor that supports them")
+        for note in warnings:
+            lines.append(f"0 Note: {note}")
+        lines.append("")
+        for p in parts:
+            rot = " ".join(str(int(v)) for v in p["rot"])
+            lines.append(
+                f"1 {p['color']} {p['x']:.2f} {p['y']:.2f} {p['z']:.2f} {rot} {p['part']}.dat"
+            )
+        return "\n".join(lines) + "\n"
+
+    def _fill_print_grid(self, parts, solid, nostud, wedges, scale):
+        """Fill a plate-and-stud grid from the same parts the LDraw file uses.
+
+        One plate is 3.2 mm, one stud is 8 mm. A slope is not a box: it is
+        recorded as a wedge so the printed stair actually slopes.
+        """
+        ny, nz, nx = solid.shape
+        plates_per = 3 * scale
+        qstud = {"NW": (0, 0), "NE": (1, 0), "SW": (0, 1), "SE": (1, 1)}
+
+        def fill_studs(ix, iz, iy0, iy1):
+            for iy in range(iy0, iy1):
+                if 0 <= iy < ny and 0 <= iz < nz and 0 <= ix < nx:
+                    solid[iy, iz, ix] = True
+
+        for p in parts:
+            y = p["y_mc"]
+            if p["kind"] == "slope":
+                ixs, izs = [], []
+                for q in p["quads"]:
+                    dx, dz = qstud[q]
+                    # Slopes are only emitted at 2x, where a quadrant is one stud.
+                    ixs.append(p["cells"][0][2] * scale + dx)
+                    izs.append(p["cells"][0][1] * scale + dz)
+                for ix, iz in zip(ixs, izs):
+                    # The slope covers the studs of the brick underneath it.
+                    # Highest solid plate under the slope is the top plate of the lower brick.
+                    nostud.add((ix, iz, y * plates_per + 2))
+                wedges.append({
+                    "x0": min(ixs) * 8.0,
+                    "x1": (max(ixs) + 1) * 8.0,
+                    "z0": min(izs) * 8.0,
+                    "z1": (max(izs) + 1) * 8.0,
+                    "y_base": (y * plates_per + 3) * 3.2,
+                    "high": p.get("high") or "north",
+                })
+                continue
+            if p["kind"] == "plate":
+                for y_mc, z, x in p["cells"]:
+                    iy = y_mc * plates_per + (plates_per - 1 if p.get("plate_top") else 0)
+                    for dz in range(scale):
+                        for dx in range(scale):
+                            fill_studs(x * scale + dx, z * scale + dz, iy, iy + 1)
+                continue
+            if p.get("quads"):
+                iy0 = y * plates_per + (3 if p["sub"] == "upper" else 0)
+                for q in p["quads"]:
+                    dx, dz = qstud[q]
+                    x = p["cells"][0][2]
+                    z = p["cells"][0][1]
+                    fill_studs(x * scale + dx, z * scale + dz, iy0, iy0 + 3)
+                continue
+            # Full bricks: 3 plates per brick layer, every stud of each cell.
+            if scale == 1 or p["sub"] == "full":
+                iy0 = y * plates_per
+            elif p["sub"] == "lower":
+                iy0 = y * plates_per
+            else:
+                iy0 = y * plates_per + 3
+            for y_mc, z, x in p["cells"]:
+                for dz in range(scale):
+                    for dx in range(scale):
+                        fill_studs(x * scale + dx, z * scale + dz, iy0, iy0 + 3)
+
+    def write_stl(self, path: str, model: Dict) -> int:
+        """Write a binary STL in millimeters, Y up, base on the bed.
+
+        The body is one watertight shell. Studs and slopes overlap it by
+        0.2 mm so a slicer joins them into a single printable solid.
+        """
+        solid = model["solid"]
+        nostud = model["nostud"]
+        wedges = model["wedges"]
+        tris = []
+        self._mesh_voxels(solid, tris)
+        self._mesh_studs(solid, nostud, tris)
+        self._mesh_wedges(wedges, tris)
+        self._mesh_base(solid, tris)
+        if not tris:
+            raise RuntimeError("STL is empty — the schematic had no solid blocks")
+        volume = 0.0
+        for a, b, c in tris:
+            volume += float(np.dot(a, np.cross(b, c)))
+        if volume < 0:
+            tris = [(a, c, b) for a, b, c in tris]
+        min_y = min(p[1] for tri in tris for p in tri)
+        shifted = []
+        for a, b, c in tris:
+            shifted.append(tuple((p[0], p[1] - min_y, p[2]) for p in (a, b, c)))
+        self._write_binary_stl(path, shifted)
+        print(f"Saved STL: {path} ({len(shifted)} triangles)")
+        return len(shifted)
+
+    def _mesh_voxels(self, solid, tris):
+        """One quad per exposed plate face.
+
+        Merging those quads into bigger rectangles makes T-junctions where a
+        long edge meets two short ones, and slicers treat that as a hole.
+        Faces are found with numpy so a full schematic stays quick.
+        """
+        if solid.size == 0 or not solid.any():
+            return
+        ny, nz, nx = solid.shape
+        sy, sz, sx = 3.2, 8.0, 8.0
+
+        def quad(p0, p1, p2, p3):
+            tris.append((p0, p1, p2))
+            tris.append((p0, p2, p3))
+
+        def emit(iys, izs, ixs, face):
+            for iy, iz, ix in zip(iys.tolist(), izs.tolist(), ixs.tolist()):
+                x0, x1 = ix * sx, (ix + 1) * sx
+                z0, z1 = iz * sz, (iz + 1) * sz
+                y0, y1 = iy * sy, (iy + 1) * sy
+                if face == "+y":
+                    quad((x0, y1, z0), (x0, y1, z1), (x1, y1, z1), (x1, y1, z0))
+                elif face == "-y":
+                    quad((x0, y0, z0), (x1, y0, z0), (x1, y0, z1), (x0, y0, z1))
+                elif face == "+x":
+                    quad((x1, y0, z0), (x1, y1, z0), (x1, y1, z1), (x1, y0, z1))
+                elif face == "-x":
+                    quad((x0, y0, z0), (x0, y0, z1), (x0, y1, z1), (x0, y1, z0))
+                elif face == "+z":
+                    quad((x0, y0, z1), (x1, y0, z1), (x1, y1, z1), (x0, y1, z1))
+                else:
+                    quad((x0, y0, z0), (x0, y1, z0), (x1, y1, z0), (x1, y0, z0))
+
+        # +Y: the voxel below an empty cell, plus the very top layer.
+        emit(*np.where(solid[:-1] & ~solid[1:]), "+y")
+        cap_z, cap_x = np.where(solid[-1])
+        emit(np.full(cap_z.shape, ny - 1), cap_z, cap_x, "+y")
+        # -Y: voxel iy>=1 with air under it. where() on the sliced array is iy-1.
+        below_y, below_z, below_x = np.where(solid[1:] & ~solid[:-1])
+        emit(below_y + 1, below_z, below_x, "-y")
+        bot_z, bot_x = np.where(solid[0])
+        emit(np.zeros(bot_z.shape, dtype=int), bot_z, bot_x, "-y")
+        # +X / -X. A slice along X shifts the index of the far side by 1.
+        # The grid edge is always exposed, so the first and last columns are capped.
+        emit(*np.where(solid[:, :, :-1] & ~solid[:, :, 1:]), "+x")
+        edge_y, edge_z = np.where(solid[:, :, -1])
+        emit(edge_y, edge_z, np.full(edge_y.shape, nx - 1), "+x")
+        neg_y, neg_z, neg_x = np.where(solid[:, :, 1:] & ~solid[:, :, :-1])
+        emit(neg_y, neg_z, neg_x + 1, "-x")
+        edge_y, edge_z = np.where(solid[:, :, 0])
+        emit(edge_y, edge_z, np.zeros(edge_y.shape, dtype=int), "-x")
+        emit(*np.where(solid[:, :-1, :] & ~solid[:, 1:, :]), "+z")
+        edge_y, edge_x = np.where(solid[:, -1, :])
+        emit(edge_y, np.full(edge_y.shape, nz - 1), edge_x, "+z")
+        neg_y, neg_z, neg_x = np.where(solid[:, 1:, :] & ~solid[:, :-1, :])
+        emit(neg_y, neg_z + 1, neg_x, "-z")
+        edge_y, edge_x = np.where(solid[:, 0, :])
+        emit(edge_y, np.zeros(edge_y.shape, dtype=int), edge_x, "-z")
+
+    def _mesh_studs(self, solid, nostud, tris):
+        if solid.size == 0 or not solid.any():
+            return
+        # Highest filled plate in each stud column.
+        top = solid.shape[0] - 1 - np.argmax(solid[::-1], axis=0)
+        has = solid.any(axis=0)
+        izs, ixs = np.where(has)
+        for iz, ix in zip(izs.tolist(), ixs.tolist()):
+            iy = int(top[iz, ix])
+            if (ix, iz, iy) in nostud:
+                continue
+            self._add_stud(tris, ix * 8.0 + 4.0, iz * 8.0 + 4.0, (iy + 1) * 3.2)
+
+    def _add_stud(self, tris, cx, cz, yb):
+        radius = 2.4
+        height = 1.8
+        y0 = yb - 0.2
+        y1 = yb + height
+        n = 8
+        bottom, top = [], []
+        for i in range(n):
+            ang = 2.0 * math.pi * i / n
+            bottom.append((cx + radius * math.cos(ang), y0, cz + radius * math.sin(ang)))
+            top.append((cx + radius * math.cos(ang), y1, cz + radius * math.sin(ang)))
+        center_b = (cx, y0, cz)
+        center_t = (cx, y1, cz)
+        for i in range(n):
+            j = (i + 1) % n
+            tris.append((bottom[i], top[i], top[j]))
+            tris.append((bottom[i], top[j], bottom[j]))
+            tris.append((center_t, top[i], top[j]))
+            tris.append((center_b, bottom[j], bottom[i]))
+
+    def _mesh_wedges(self, wedges, tris):
+        def quad(p0, p1, p2, p3):
+            tris.append((p0, p1, p2))
+            tris.append((p0, p2, p3))
+
+        for w in wedges:
+            x0, x1 = w["x0"], w["x1"]
+            z0, z1 = w["z0"], w["z1"]
+            yb = w["y_base"] - 0.2
+            yh = w["y_base"] + 9.6
+            high = w["high"]
+            # Bottom overlaps the brick under the slope. High edge is full
+            # brick height; the low edge meets the step.
+            if high == "north":
+                h0, h1 = (x0, yh, z0), (x1, yh, z0)
+                b0, b1 = (x0, yb, z0), (x1, yb, z0)
+                l0, l1 = (x0, yb, z1), (x1, yb, z1)
+            elif high == "south":
+                h0, h1 = (x0, yh, z1), (x1, yh, z1)
+                b0, b1 = (x0, yb, z1), (x1, yb, z1)
+                l0, l1 = (x0, yb, z0), (x1, yb, z0)
+            elif high == "west":
+                h0, h1 = (x0, yh, z0), (x0, yh, z1)
+                b0, b1 = (x0, yb, z0), (x0, yb, z1)
+                l0, l1 = (x1, yb, z0), (x1, yb, z1)
+            else:
+                h0, h1 = (x1, yh, z0), (x1, yh, z1)
+                b0, b1 = (x1, yb, z0), (x1, yb, z1)
+                l0, l1 = (x0, yb, z0), (x0, yb, z1)
+            quad(b0, b1, l1, l0)
+            quad(b0, h0, h1, b1)
+            quad(h0, l0, l1, h1)
+            tris.append((b0, l0, h0))
+            tris.append((b1, h1, l1))
+
+    def _mesh_base(self, solid, tris):
+        """A flat plate under the lowest blocks, so the print has a bed to sit on."""
+        ny, nz, nx = solid.shape
+        min_iy = None
+        xs, zs = [], []
+        for iy in range(ny):
+            if solid[iy].any():
+                min_iy = iy
+                for iz in range(nz):
+                    for ix in range(nx):
+                        if solid[iy, iz, ix]:
+                            xs.append(ix)
+                            zs.append(iz)
+                break
+        if min_iy is None:
+            return
+        x0, x1 = min(xs) * 8.0, (max(xs) + 1) * 8.0
+        z0, z1 = min(zs) * 8.0, (max(zs) + 1) * 8.0
+        y1 = min_iy * 3.2 + 0.15
+        y0 = min_iy * 3.2 - 3.2
+
+        def quad(p0, p1, p2, p3):
+            tris.append((p0, p1, p2))
+            tris.append((p0, p2, p3))
+
+        quad((x0, y1, z0), (x0, y1, z1), (x1, y1, z1), (x1, y1, z0))
+        quad((x0, y0, z0), (x1, y0, z0), (x1, y0, z1), (x0, y0, z1))
+        quad((x1, y0, z0), (x1, y1, z0), (x1, y1, z1), (x1, y0, z1))
+        quad((x0, y0, z0), (x0, y0, z1), (x0, y1, z1), (x0, y1, z0))
+        quad((x0, y0, z1), (x1, y0, z1), (x1, y1, z1), (x0, y1, z1))
+        quad((x0, y0, z0), (x0, y1, z0), (x1, y1, z0), (x1, y0, z0))
+
+    def _write_binary_stl(self, path, tris):
+        os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+        with open(path, "wb") as handle:
+            handle.write(b"Minecraft to LEGO".ljust(80, b"\0"))
+            handle.write(struct.pack("<I", len(tris)))
+            for a, b, c in tris:
+                normal = np.cross(np.subtract(b, a), np.subtract(c, a))
+                length = float(np.linalg.norm(normal))
+                if length > 0:
+                    normal = normal / length
+                else:
+                    normal = np.zeros(3)
+                handle.write(struct.pack("<3f", float(normal[0]), float(normal[1]), float(normal[2])))
+                for p in (a, b, c):
+                    handle.write(struct.pack("<3f", float(p[0]), float(p[1]), float(p[2])))
+                handle.write(struct.pack("<H", 0))
+
     def convert_to_ldraw(self, schematic_data: Dict, optimize: bool = False, scale: int = 1) -> str:
         """
-        Convert schematic data to LDraw format
+        Convert schematic data to LDraw format.
 
         Args:
             schematic_data: Loaded schematic data
@@ -978,389 +1962,10 @@ class MinecraftToLegoConverter:
         Returns:
             LDraw format string
         """
-        blocks = schematic_data['blocks']
-        width = schematic_data['width']
-        height = schematic_data['height']
-        length = schematic_data['length']
-
-        ldraw_lines = []
-        ldraw_lines.append("0 Jonathan Rothberg's MineCraft to LEGO converter")
-        ldraw_lines.append("0 Name: Converted from Minecraft")
-        ldraw_lines.append("0 Author: Jonathan Rothberg")
-        if optimize:
-            ldraw_lines.append("0 Optimized: Yes (merged bricks)")
-        if scale > 1:
-            ldraw_lines.append(f"0 Scale: {scale}x (each MC block = {scale} studs)")
-        ldraw_lines.append("")
-
-        brick_count = 0
-
-        if optimize:
-            # Optimized conversion - merge adjacent same-color blocks
-            brick_count = self._convert_optimized(schematic_data, ldraw_lines, width, height, length, scale)
-        else:
-            # Standard 1x1 brick conversion
-            brick_count = self._convert_standard(schematic_data, ldraw_lines, width, height, length, scale)
-
-        print(f"Converted to {brick_count} Lego bricks")
-        return "\n".join(ldraw_lines)
-
-    def _emit_block_2x(self, ldraw_lines: List, base_x: float, base_y: float, base_z: float,
-                       color_id: int, special_info: Optional[Dict]) -> int:
-        """Emit LEGO parts for a single MC block at 2x scale.
-        Returns the number of parts emitted."""
-        identity = "1 0 0 0 1 0 0 0 1"
-        count = 0
-
-        if special_info and special_info["type"] == "stair":
-            facing = special_info.get("facing", "north")
-            half = special_info.get("half", "bottom")
-            # At 2x, 3039 (2x2 slope) fits perfectly: 40x40 LDU = 2 studs.
-            # Bottom brick (3003) + slope on top (3039) = 24+24 = 48 LDU = full block.
-            rotation = self.rotations.get(facing, self.rotations["north"])
-            if half == "bottom":
-                # Full brick on bottom, slope on top
-                ldraw_lines.append(f"1 {color_id} {base_x:.2f} {base_y + 24:.2f} {base_z:.2f} {identity} 3003.dat")
-                ldraw_lines.append(f"1 {color_id} {base_x:.2f} {base_y:.2f} {base_z:.2f} {rotation} 3039.dat")
-            else:
-                # Inverted: brick on top, flipped slope on bottom
-                flipped = self._flip_rotation_y(rotation)
-                ldraw_lines.append(f"1 {color_id} {base_x:.2f} {base_y:.2f} {base_z:.2f} {identity} 3003.dat")
-                ldraw_lines.append(f"1 {color_id} {base_x:.2f} {base_y + 24:.2f} {base_z:.2f} {flipped} 3039.dat")
-            count = 2
-
-        elif special_info and special_info["type"] == "slab":
-            slab_type = special_info.get("slab_type", "bottom")
-            # Single 2x2 brick = exactly half the 48 LDU block height
-            if slab_type == "bottom":
-                ldraw_lines.append(f"1 {color_id} {base_x:.2f} {base_y + 24:.2f} {base_z:.2f} {identity} 3003.dat")
-            else:  # top
-                ldraw_lines.append(f"1 {color_id} {base_x:.2f} {base_y:.2f} {base_z:.2f} {identity} 3003.dat")
-            count = 1
-
-        elif special_info and special_info["type"] == "carpet":
-            # 2x2 plate at floor level (bottom of 48 LDU space)
-            ldraw_lines.append(f"1 {color_id} {base_x:.2f} {base_y + 40:.2f} {base_z:.2f} {identity} 3022.dat")
-            count = 1
-
-        else:
-            # Full block: two stacked 2x2 bricks (each 24 LDU tall = 48 total)
-            ldraw_lines.append(f"1 {color_id} {base_x:.2f} {base_y:.2f} {base_z:.2f} {identity} 3003.dat")
-            ldraw_lines.append(f"1 {color_id} {base_x:.2f} {base_y + 24:.2f} {base_z:.2f} {identity} 3003.dat")
-            count = 2
-
-        return count
-
-    def _convert_standard(self, schematic_data: Dict, ldraw_lines: List, width: int, height: int, length: int, scale: int = 1) -> int:
-        """Standard conversion - one brick per Minecraft block (or 2x scale parts)"""
-        blocks = schematic_data['blocks']
-        brick_count = 0
-
-        # Check if we have block names (.schem format)
-        has_block_names = 'block_names' in schematic_data and schematic_data['block_names'] is not None
-        block_names = schematic_data.get('block_names', [])
-
-        # Scale-dependent sizes
-        stud_size = 20 * scale    # 20 at 1x, 40 at 2x
-        brick_height = 24 * scale  # 24 at 1x, 48 at 2x
-
-        for y in range(height):
-            for z in range(length):
-                for x in range(width):
-                    block_id = blocks[y, z, x]
-
-                    # Skip air blocks (ID 0)
-                    if block_id == 0:
-                        continue
-
-                    # Get color and check for special parts based on format
-                    block_name = None
-                    if has_block_names:
-                        # .schem format - use block name for accurate color
-                        data_index = y * length * width + z * width + x
-                        if data_index < len(block_names):
-                            block_name = block_names[data_index]
-                            color_id = self._get_color_from_block_name(block_name)
-                            # Skip air blocks
-                            if color_id == -1:
-                                continue
-                            # Skip non-solid blocks (torches, signs, doors, etc.)
-                            if self._is_skip_block(block_name):
-                                continue
-                        else:
-                            color_id = 7  # Default gray
-                    else:
-                        # Old .schematic format - use numeric ID and data value
-                        data_value = 0
-                        if schematic_data['data'] is not None:
-                            data_index = y * length * width + z * width + x
-                            if data_index < len(schematic_data['data']):
-                                data_value = schematic_data['data'][data_index]
-                        _, color_id = self.get_brick_info(block_id, data_value)
-
-                    # Check for special parts (stairs, slabs, carpet) - only for .schem format
-                    special_info = None
-                    if block_name:
-                        special_info = self._get_special_part_info(block_name)
-                        if special_info:
-                            if not hasattr(self, '_special_counts'):
-                                self._special_counts = {"stair": 0, "slab": 0, "carpet": 0}
-                            stype = special_info["type"]
-                            if stype in self._special_counts:
-                                self._special_counts[stype] += 1
-
-                    # Convert coordinates to LDraw units
-                    ldraw_x = (x - width / 2) * stud_size
-                    ldraw_y = -y * brick_height
-                    ldraw_z = (z - length / 2) * stud_size
-
-                    if scale == 2:
-                        brick_count += self._emit_block_2x(ldraw_lines, ldraw_x, ldraw_y, ldraw_z,
-                                                           color_id, special_info)
-                    else:
-                        # Scale 1: single part per block
-                        brick_type = self.default_brick
-                        rotation = "1 0 0 0 1 0 0 0 1"
-                        y_offset = 0
-                        # At 1x, only slabs/carpet get special parts.
-                        # Stairs use regular bricks (no room for sub-block slopes at 1 stud).
-                        if special_info and special_info["type"] != "stair":
-                            brick_type = special_info["part"]
-                            rotation = special_info["rotation"]
-                            y_offset = special_info["y_offset"]
-
-                        ldraw_line = f"1 {color_id} {ldraw_x:.2f} {ldraw_y + y_offset:.2f} {ldraw_z:.2f} {rotation} {brick_type}.dat"
-                        ldraw_lines.append(ldraw_line)
-                        brick_count += 1
-
-        # Print special part counts if any were found
-        if hasattr(self, '_special_counts') and any(self._special_counts.values()):
-            stair_ct = self._special_counts.get('stair', 0)
-            slab_ct = self._special_counts.get('slab', 0)
-            carpet_ct = self._special_counts.get('carpet', 0)
-            parts = []
-            if stair_ct:
-                parts.append(f"{stair_ct} stairs")
-            if slab_ct:
-                parts.append(f"{slab_ct} slabs")
-            if carpet_ct:
-                parts.append(f"{carpet_ct} carpets")
-            print(f"   Special parts: {', '.join(parts)}")
-
-        return brick_count
-
-    def _convert_optimized(self, schematic_data: Dict, ldraw_lines: List, width: int, height: int, length: int, scale: int = 1) -> int:
-        """Optimized conversion - merge adjacent same-color blocks into larger bricks"""
-        blocks = schematic_data['blocks']
-        brick_count = 0
-
-        # Check if we have block names (.schem format)
-        has_block_names = 'block_names' in schematic_data and schematic_data['block_names'] is not None
-        block_names = schematic_data.get('block_names', [])
-
-        # Scale-dependent sizes
-        stud_size = 20 * scale
-        brick_height = 24 * scale
-
-        # Build color grid (stores color_id for each position, -1 for air)
-        color_grid = np.full((height, length, width), -1, dtype=np.int16)
-        # Track special blocks that shouldn't be merged
-        special_blocks = np.zeros((height, length, width), dtype=bool)
-
-        print("Analyzing blocks for optimization...")
-
-        for y in range(height):
-            for z in range(length):
-                for x in range(width):
-                    block_id = blocks[y, z, x]
-                    if block_id == 0:
-                        continue
-
-                    # Get color and check for special blocks
-                    if has_block_names:
-                        # .schem format - use block name for accurate color
-                        data_index = y * length * width + z * width + x
-                        if data_index < len(block_names):
-                            block_name = block_names[data_index]
-                            color_id = self._get_color_from_block_name(block_name)
-                            if color_id == -1:  # Skip air
-                                continue
-                            # Skip non-solid blocks (torches, signs, doors, etc.)
-                            if self._is_skip_block(block_name):
-                                continue
-
-                            # Check if this is a special block (slabs, carpet, stairs at 2x)
-                            sp = self._get_special_part_info(block_name)
-                            if sp and (scale > 1 or sp["type"] != "stair"):
-                                special_blocks[y, z, x] = True
-                        else:
-                            color_id = 7
-                    else:
-                        # Old .schematic format
-                        data_value = 0
-                        if schematic_data['data'] is not None:
-                            data_index = y * length * width + z * width + x
-                            if data_index < len(schematic_data['data']):
-                                data_value = schematic_data['data'][data_index]
-                        _, color_id = self.get_brick_info(block_id, data_value)
-
-                    color_grid[y, z, x] = color_id
-
-        # Track which cells have been used
-        used = np.zeros((height, length, width), dtype=bool)
-
-        # At scale=2, each MC block = 2 studs, so merge runs map to 2-wide bricks:
-        #   1 block = 3003 (2x2), 2 = 3001 (2x4), 3 = 2456 (2x6), 4 = 3007 (2x8)
-        if scale == 2:
-            scale2_x_lengths = [4, 3, 2, 1]
-            scale2_brick_map = {1: "3003", 2: "3001", 3: "2456", 4: "3007"}
-        else:
-            # Available brick lengths (X direction), sorted largest first
-            x_lengths = [8, 6, 4, 3, 2, 1]
-
-        print("Merging bricks (this may take a moment)...")
-
-        for y in range(height):
-            for z in range(length):
-                for x in range(width):
-                    if used[y, z, x] or color_grid[y, z, x] == -1 or special_blocks[y, z, x]:
-                        continue
-
-                    color_id = color_grid[y, z, x]
-
-                    if scale == 2:
-                        # Scale 2: merge in X only, max 4 MC blocks
-                        best_x_len = 1
-                        for x_len in scale2_x_lengths:
-                            if x + x_len > width:
-                                continue
-                            valid = True
-                            for dx in range(x_len):
-                                if (used[y, z, x + dx] or color_grid[y, z, x + dx] != color_id
-                                        or special_blocks[y, z, x + dx]):
-                                    valid = False
-                                    break
-                            if valid:
-                                best_x_len = x_len
-                                break
-
-                        # Mark cells as used
-                        for dx in range(best_x_len):
-                            used[y, z, x + dx] = True
-
-                        # Get the 2-wide brick for this run length
-                        brick_type = scale2_brick_map[best_x_len]
-
-                        # Center of merged run in MC block coords
-                        center_x = x + (best_x_len - 1) / 2
-
-                        ldraw_x = (center_x - width / 2) * stud_size
-                        ldraw_y = -y * brick_height
-                        ldraw_z = (z - length / 2) * stud_size
-
-                        identity = "1 0 0 0 1 0 0 0 1"
-                        # Emit two layers (top + bottom) for full blocks
-                        ldraw_lines.append(f"1 {color_id} {ldraw_x:.2f} {ldraw_y:.2f} {ldraw_z:.2f} {identity} {brick_type}.dat")
-                        ldraw_lines.append(f"1 {color_id} {ldraw_x:.2f} {ldraw_y + 24:.2f} {ldraw_z:.2f} {identity} {brick_type}.dat")
-                        brick_count += 2
-
-                    else:
-                        # Scale 1: existing merge logic
-                        best_x_len = 1
-                        for x_len in x_lengths:
-                            if x + x_len > width:
-                                continue
-                            valid = True
-                            for dx in range(x_len):
-                                if used[y, z, x + dx] or color_grid[y, z, x + dx] != color_id:
-                                    valid = False
-                                    break
-                            if valid:
-                                best_x_len = x_len
-                                break
-
-                        # Try to extend in Z direction for 2-wide bricks
-                        best_z_len = 1
-                        if z + 1 < length and best_x_len >= 2:
-                            can_extend_z = True
-                            for dx in range(best_x_len):
-                                if used[y, z + 1, x + dx] or color_grid[y, z + 1, x + dx] != color_id:
-                                    can_extend_z = False
-                                    break
-                            if can_extend_z:
-                                if (2, best_x_len) in self.brick_sizes:
-                                    best_z_len = 2
-
-                        # Get the brick part number
-                        brick_key = (best_z_len, best_x_len)
-                        if brick_key in self.brick_sizes:
-                            brick_type = self.brick_sizes[brick_key]
-                        else:
-                            brick_type = self.default_brick
-                            best_x_len = 1
-                            best_z_len = 1
-
-                        # Mark cells as used
-                        for dz in range(best_z_len):
-                            for dx in range(best_x_len):
-                                used[y, z + dz, x + dx] = True
-
-                        # Calculate position (center of the brick)
-                        center_x = x + (best_x_len - 1) / 2
-                        center_z = z + (best_z_len - 1) / 2
-
-                        ldraw_x = (center_x - width / 2) * 20
-                        ldraw_y = -y * 24
-                        ldraw_z = (center_z - length / 2) * 20
-
-                        ldraw_line = f"1 {color_id} {ldraw_x:.2f} {ldraw_y:.2f} {ldraw_z:.2f} 1 0 0 0 1 0 0 0 1 {brick_type}.dat"
-                        ldraw_lines.append(ldraw_line)
-                        brick_count += 1
-
-        # Process special blocks (stairs, slabs, etc.) individually - don't merge them
-        print("Processing special blocks (stairs, slabs)...")
-        for y in range(height):
-            for z in range(length):
-                for x in range(width):
-                    # Skip if already processed or not special
-                    if used[y, z, x] or not special_blocks[y, z, x] or color_grid[y, z, x] == -1:
-                        continue
-
-                    # Get block name for special processing
-                    block_name = None
-                    if has_block_names:
-                        data_index = y * length * width + z * width + x
-                        if data_index < len(block_names):
-                            block_name = block_names[data_index]
-
-                    if not block_name:
-                        continue
-
-                    special_info = self._get_special_part_info(block_name)
-                    if not special_info:
-                        continue
-
-                    # Mark as used
-                    used[y, z, x] = True
-                    color_id = color_grid[y, z, x]
-
-                    ldraw_x = (x - width / 2) * stud_size
-                    ldraw_y = -y * brick_height
-                    ldraw_z = (z - length / 2) * stud_size
-
-                    if scale == 2:
-                        brick_count += self._emit_block_2x(ldraw_lines, ldraw_x, ldraw_y, ldraw_z,
-                                                           color_id, special_info)
-                    else:
-                        brick_type = special_info["part"]
-                        rotation = special_info["rotation"]
-                        y_offset = special_info["y_offset"]
-
-                        ldraw_line = f"1 {color_id} {ldraw_x:.2f} {ldraw_y + y_offset:.2f} {ldraw_z:.2f} {rotation} {brick_type}.dat"
-                        ldraw_lines.append(ldraw_line)
-                        brick_count += 1
-
-        return brick_count
+        model = self.build_model(schematic_data, optimize=optimize, scale=scale)
+        self.last_model = model
+        print(f"Converted to {model['stats']['bricks']} Lego bricks")
+        return model["ldraw"]
 
     def save_ldraw_file(self, ldraw_content: str, output_path: str):
         """
@@ -1377,15 +1982,16 @@ class MinecraftToLegoConverter:
         except Exception as e:
             print(f"Error saving LDraw file: {e}")
 
-    def convert_file(self, input_path: str, output_path: str = None, optimize: bool = False, scale: int = 1) -> bool:
+    def convert_file(self, input_path: str, output_path: str = None, optimize: bool = False, scale: int = 1, stl_path: str = None) -> bool:
         """
-        Convert a single Minecraft schematic file to LDraw
+        Convert a single Minecraft schematic file to LDraw and, optionally, STL.
 
         Args:
             input_path: Path to input schematic file
             output_path: Path to output LDraw file (auto-generated if None)
             optimize: If True, merge adjacent same-color blocks into larger bricks
             scale: Scale factor (1 = 1 stud per block, 2 = 2 studs per block)
+            stl_path: If set, also write a printable STL of the same model
 
         Returns:
             True if conversion successful, False otherwise
@@ -1404,23 +2010,165 @@ class MinecraftToLegoConverter:
         if schematic is None:
             return False
 
-        # Convert to LDraw
-        ldraw_content = self.convert_to_ldraw(schematic, optimize=optimize, scale=scale)
-
-        # Save LDraw file
-        self.save_ldraw_file(ldraw_content, output_path)
-
+        # One plan feeds both the LEGO file and the printable mesh.
+        model = self.build_model(schematic, optimize=optimize, scale=scale)
+        self.last_model = model
+        self.save_ldraw_file(model["ldraw"], output_path)
+        if stl_path:
+            self.write_stl(stl_path, model)
+        print(f"Converted to {model['stats']['bricks']} Lego bricks")
         return True
 
+def _edge_problems(tris):
+    """A watertight mesh uses every edge exactly twice."""
+    from collections import Counter
+    counts = Counter()
+    for tri in tris:
+        pts = [tuple(round(float(v), 3) for v in p) for p in tri]
+        for i in range(3):
+            edge = tuple(sorted((pts[i], pts[(i + 1) % 3])))
+            counts[edge] += 1
+    return [n for n in counts.values() if n != 2]
+
+def run_geometry_self_test() -> bool:
+    """Build a tiny schematic with a step, an upside-down stair, both corners, and a one-block overhang.
+
+    Checks that the overhang is one brick with the wall, that open stairs slope,
+    that a stair under a block stays flat so the block can sit on it, and that
+    the STL is a closed mesh.
+    """
+    width, height, length = 6, 4, 6
+    names = ["minecraft:air"] * (width * height * length)
+    blocks = np.zeros((height, length, width), dtype=np.int16)
+
+    def put(x, y, z, name):
+        names[y * length * width + z * width + x] = name
+        blocks[y, z, x] = 1
+
+    # Floor, with a hole under the overhang column (x=2, z=2).
+    for z in range(length):
+        for x in range(width):
+            if (x, z) != (2, 2):
+                put(x, 0, z, "minecraft:stone")
+    # Wall the overhang and the sticking-out stair attach to.
+    for y in (1, 2):
+        put(1, y, 2, "minecraft:stone")
+        put(5, y, 2, "minecraft:stone")
+    put(2, 2, 2, "minecraft:stone")  # one-block overhang, air below
+    put(5, 2, 3, "minecraft:stone_stairs[facing=south,half=bottom,shape=straight]")
+    put(4, 1, 1, "minecraft:oak_stairs[facing=north,half=bottom,shape=straight]")
+    put(4, 1, 2, "minecraft:oak_stairs[facing=north,half=bottom,shape=straight]")
+    put(4, 2, 2, "minecraft:stone")  # sits on the stair, so that stair must keep its studs
+    put(4, 1, 4, "minecraft:oak_stairs[facing=east,half=top,shape=straight]")
+    put(0, 1, 4, "minecraft:oak_stairs[facing=north,half=bottom,shape=inner_left]")
+    put(0, 1, 5, "minecraft:oak_stairs[facing=north,half=bottom,shape=outer_left]")
+
+    schematic = {
+        "width": width, "height": height, "length": length,
+        "blocks": blocks, "data": None, "block_names": names, "format": "schem",
+    }
+    converter = MinecraftToLegoConverter()
+    model = converter.build_model(schematic, optimize=False, scale=2)
+    parts = model["parts"]
+    failed = []
+
+    def covers(part, x, y, z, sub):
+        return part["sub"] == sub and (y, z, x) in part["cells"]
+
+    overhang = [p for p in parts if covers(p, 2, 2, 2, "lower") and covers(p, 1, 2, 2, "lower")]
+    if len(overhang) != 1 or overhang[0]["part"] != "3001" or overhang[0]["floating"]:
+        failed.append(f"overhang lower brick: {[(p['part'], p['cells'], p['floating']) for p in parts if covers(p, 2, 2, 2, 'lower')]}")
+    stair_anchor = [p for p in parts if covers(p, 5, 2, 3, "lower") and covers(p, 5, 2, 2, "lower")]
+    if len(stair_anchor) != 1 or stair_anchor[0]["floating"]:
+        failed.append("stair overhang did not join the wall under it")
+
+    slopes = [p for p in parts if p["part"] == "3040"]
+    open_slope = [p for p in slopes if covers(p, 4, 1, 1, "upper")]
+    if len(open_slope) != 1 or open_slope[0].get("high") != "north":
+        failed.append(f"open stair should be one north-high slope, got {open_slope}")
+    capped = [p for p in parts if covers(p, 4, 1, 2, "upper")]
+    if any(p["part"] == "3040" for p in capped) or not any(p["part"] == "3004" for p in capped):
+        failed.append("stair under a block must be a flat 3004, not a slope")
+
+    upside = [p for p in parts if covers(p, 4, 1, 4, "lower") and p.get("quads")]
+    upside_top = [p for p in parts if covers(p, 4, 1, 4, "upper") and p["part"] == "3003"]
+    if not upside or not upside_top:
+        failed.append("upside-down stair needs a low step and a full brick on top")
+    if upside and set().union(*[p["quads"] for p in upside]) != {"NE", "SE"}:
+        failed.append(f"upside-down high side should be east, got {[p['quads'] for p in upside]}")
+
+    inner = [p for p in parts if covers(p, 0, 1, 4, "upper") and p.get("quads")]
+    inner_quads = set().union(*[p["quads"] for p in inner]) if inner else set()
+    if inner_quads != {"NW", "NE", "SW"}:
+        failed.append(f"inner corner quadrants {inner_quads}")
+    outer = [p for p in parts if covers(p, 0, 1, 5, "upper") and p.get("quads")]
+    outer_quads = set().union(*[p["quads"] for p in outer]) if outer else set()
+    if outer_quads != {"NW"}:
+        failed.append(f"outer corner quadrants {outer_quads}")
+
+    if model["stats"]["floating"] != 0:
+        failed.append(f"expected no loose pieces, got {model['stats']['floating']}")
+    if model["stats"]["anchored"] < 2:
+        failed.append(f"expected anchored overhangs, got {model['stats']['anchored']}")
+
+    for p in parts:
+        # Studs are 20 LDU apart. A 1-stud piece sitting on one half of a
+        # 2-stud block is shifted by 10. Brick height is 24, so Y is not a stud.
+        for value in (p["x"], p["z"]):
+            if abs(value / 10 - round(value / 10)) > 1e-6:
+                failed.append(f"part {p['part']} is off the stud grid at {value}")
+                break
+        if abs(p["y"] / 8 - round(p["y"] / 8)) > 1e-6:
+            failed.append(f"part {p['part']} height {p['y']} is not a plate multiple")
+
+    out = os.path.join(os.path.dirname(os.path.abspath(__file__)), "models", "geometry_test.stl")
+    ldr = os.path.join(os.path.dirname(os.path.abspath(__file__)), "models", "geometry_test.ldr")
+    converter.save_ldraw_file(model["ldraw"], ldr)
+    ntris = converter.write_stl(out, model)
+    if ntris < 100 or os.path.getsize(out) < 1000:
+        failed.append("STL is too small to be a real mesh")
+    # Rebuild triangles the same way write_stl does, to check the shell is closed.
+    probe = []
+    converter._mesh_voxels(model["solid"], probe)
+    body_bad = _edge_problems(probe)
+    if body_bad:
+        failed.append(f"printed body is not closed ({len(body_bad)} bad edges)")
+    studs = []
+    converter._mesh_studs(model["solid"], model["nostud"], studs)
+    if _edge_problems(studs):
+        failed.append("studs are not closed")
+    wedges = []
+    converter._mesh_wedges(model["wedges"], wedges)
+    if not wedges or _edge_problems(wedges):
+        failed.append("slope wedges are missing or not closed")
+    # The open stair's high half is a slope, so those upper plates stay empty.
+    # Cell (x=4, z=1, y=1): lower plates are iy 6..8, studs ix 8..9 and iz 2..3.
+    # North (high) row is iz 2.
+    solid = model["solid"]
+    if not bool(solid[6:9, 2:4, 8:10].all()):
+        failed.append("open stair is missing its lower brick")
+    if solid[9:12, 2, 8:10].any():
+        failed.append("open stair filled the sloped half with a box")
+
+    if failed:
+        print("SELF-TEST FAILED")
+        for line in failed:
+            print(" -", line)
+        return False
+    print(f"SELF-TEST PASSED ({model['stats']['bricks']} pieces, {ntris} triangles)")
+    print(f"STL: {out}")
+    return True
+
 def main():
-    """Main function for command-line usage"""
-    parser = argparse.ArgumentParser(description="Convert Minecraft schematic files to Lego LDraw format")
-    parser.add_argument("input", help="Input Minecraft schematic file (.schematic)")
+    """Main function for command-line usage. The window in convert_interactive.py is the normal way to run this."""
+    parser = argparse.ArgumentParser(description="Convert Minecraft schematic files to Lego LDraw and STL")
+    parser.add_argument("input", help="Input Minecraft schematic file (.schematic or .schem)")
     parser.add_argument("-o", "--output", help="Output LDraw file (.ldr)")
+    parser.add_argument("--stl", help="Also write a printable STL")
+    parser.add_argument("--optimize", action="store_true", help="Merge adjacent same-color blocks into larger bricks")
     parser.add_argument("-v", "--verbose", action="store_true", help="Verbose output")
-    parser.add_argument("--scale", type=int, choices=[1, 2], default=1,
-                        help="Scale factor: 1 = 1 stud/block (default), 2 = 2 studs/block "
-                             "(stairs become L-shaped steps, slabs are exact half-height)")
+    parser.add_argument("--scale", type=int, choices=[1, 2], default=2,
+                        help="Scale factor: 2 = steps, slopes, and overhangs (default), 1 = one stud per block")
 
     args = parser.parse_args()
 
@@ -1429,10 +2177,10 @@ def main():
     if args.verbose:
         print("Minecraft to Lego Converter")
         print("===========================")
-        if args.scale > 1:
-            print(f"Scale: {args.scale}x")
+        print(f"Scale: {args.scale}x")
 
-    success = converter.convert_file(args.input, args.output, scale=args.scale)
+    success = converter.convert_file(
+        args.input, args.output, optimize=args.optimize, scale=args.scale, stl_path=args.stl)
 
     if success:
         print("Conversion completed successfully!")
@@ -1443,4 +2191,6 @@ def main():
         sys.exit(1)
 
 if __name__ == "__main__":
+    if "--self-test" in sys.argv:
+        sys.exit(0 if run_geometry_self_test() else 1)
     main()
