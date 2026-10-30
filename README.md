@@ -40,7 +40,7 @@ The conversion pipeline has three stages:
    - Slabs are half a block. At 2× that is one brick in the lower or upper half. Carpet is a plate
    - **Merge** combines neighboring blocks of the same color into longer bricks (fewer pieces)
 
-3. **Output** — An LDraw `.ldr` file for LeoCAD, and a binary STL in millimeters (8 mm per stud, 9.6 mm per brick) with a base plate and studs on the exposed tops. Open the STL in MeshLab, then send it to your slicer.
+3. **Output** — An LDraw `.ldr` file for LeoCAD, and a binary STL in millimeters (8 mm per stud, 9.6 mm per brick) with a base plate and studs on the exposed tops. Open the STL in MeshLab, then send it to your slicer. Optional: a Bambu Studio `.3mf` with one object per filament, already stacked, so the colors do not have to be lined up by hand. The window shows the suggested color of each spool. Load that file later, lower the filament count, and save a new file with fewer spools.
 
 ## Quick Start
 
@@ -50,7 +50,7 @@ The conversion pipeline has three stages:
 .venv/bin/python convert_interactive.py
 ```
 
-The window lists the schematics in `schematics/`, and you can also choose a file from anywhere. 2× scale, merged bricks, a LEGO file, and an STL are on by default. Convert writes into `models/`, then **Open LEGO file**, **Open STL**, and **Show in Finder** are enabled.
+The window lists the schematics in `schematics/`, and you can also choose a file from anywhere. 2× scale, merged bricks, a LEGO file, and an STL are on by default. **Bambu Studio (.3mf)** is optional: pick 1 to 8 filaments and the brick colors are grouped into that many spools. Convert writes into `models/`, then **Open LEGO file**, **Open STL**, **Open in Bambu**, and **Show in Finder** are enabled.
 
 Pieces that stick out farther than a real brick can reach are listed in the progress box. They are still in the model, as separate pieces.
 
@@ -62,6 +62,9 @@ Pieces that stick out farther than a real brick can reach are listed in the prog
 
 # Also merge same-color neighbors into longer bricks
 .venv/bin/python minecraft_to_lego_converter.py schematics/kismet.schem --optimize --stl models/kismet.stl
+
+# Bambu Studio file: 4 filaments, colors already stacked
+.venv/bin/python minecraft_to_lego_converter.py schematics/kismet.schem --bambu models/kismet.3mf --colors 4
 
 # One stud per block (stairs are full bricks, so they still connect)
 .venv/bin/python minecraft_to_lego_converter.py schematics/235.schematic --scale 1 -o models/235.ldr
@@ -163,7 +166,8 @@ Place `.schematic` or `.schem` files in the `schematics/` directory. You can get
 | `.ldr` | LeoCAD | Edit the bricks. Launcher: `./launch_leocad.sh` |
 | `.ldr` | LDView, BrickLink Studio | Other LEGO viewers |
 | `.stl` | MeshLab | Open the mesh before you slice it. `brew install --cask meshlab` |
-| `.stl` | Your slicer | PrusaSlicer, Bambu Studio, or Cura. The model is already in millimeters |
+| `.stl` | Your slicer | PrusaSlicer, Bambu Studio, or Cura. The model is already in millimeters. One color |
+| `.3mf` | Bambu Studio | One object per filament, in the same place. Load a spool for each filament slot |
 
 ## Supported Blocks
 

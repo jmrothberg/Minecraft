@@ -9,6 +9,7 @@
 __pycache__/
 *.py[cod]
 .venv/
+.venv-py39/
 venv/
 
 # Backup files

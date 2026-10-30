@@ -12,11 +12,55 @@ Created: 2026-01-04
 import os
 import sys
 import argparse
+import json
 import math
+import re
 import struct
+import zipfile
 import numpy as np
 from typing import Dict, List, Tuple, Optional
 import nbtlib  # For parsing Minecraft NBT files
+
+# LDraw color id -> (name, red, green, blue). Brick colors are grouped into
+# printer filaments by how close these colors are. Unknown ids use light gray.
+LDRAW_COLORS = {
+    0: ("Black", 5, 19, 29),
+    1: ("Blue", 0, 85, 191),
+    2: ("Green", 35, 120, 65),
+    4: ("Red", 201, 26, 9),
+    5: ("Dark Pink", 200, 112, 160),
+    6: ("Brown", 88, 57, 39),
+    7: ("Light Gray", 155, 161, 157),
+    8: ("Dark Gray", 109, 110, 92),
+    9: ("Light Blue", 180, 210, 227),
+    10: ("Bright Green", 75, 159, 74),
+    11: ("Light Turquoise", 85, 165, 175),
+    13: ("Pink", 252, 151, 172),
+    14: ("Yellow", 242, 205, 55),
+    15: ("White", 255, 255, 255),
+    19: ("Tan", 228, 205, 158),
+    25: ("Orange", 254, 138, 24),
+    27: ("Lime", 187, 233, 11),
+    28: ("Dark Tan", 149, 138, 115),
+    33: ("Trans Dark Blue", 0, 32, 160),
+    36: ("Trans Red", 201, 26, 9),
+    41: ("Trans Light Turquoise", 85, 165, 175),
+    42: ("Trans Light Blue", 160, 197, 232),
+    46: ("Trans Yellow", 245, 205, 47),
+    47: ("Trans Clear", 252, 252, 252),
+    70: ("Reddish Brown", 105, 64, 39),
+    71: ("Light Bluish Gray", 160, 165, 169),
+    72: ("Dark Bluish Gray", 108, 110, 104),
+    73: ("Medium Blue", 90, 147, 219),
+    85: ("Dark Purple", 63, 54, 145),
+    191: ("Bright Light Orange", 248, 187, 61),
+    288: ("Dark Green", 24, 70, 50),
+    320: ("Dark Red", 114, 14, 15),
+    326: ("Bright Light Yellow", 255, 240, 140),
+    378: ("Sand Green", 160, 188, 172),
+    379: ("Sand Purple", 132, 94, 132),
+    484: ("Dark Orange", 169, 85, 0),
+}
 
 class MinecraftToLegoConverter:
     """
@@ -1639,14 +1683,17 @@ class MinecraftToLegoConverter:
         ldraw = self._parts_to_ldraw(parts, scale, optimize, warnings)
         plates_per = 3 * scale
         solid = np.zeros((height * plates_per, length * scale, width * scale), dtype=bool)
+        # -1 is air. A filled cell keeps the LDraw color so the Bambu file can split by filament.
+        paint = np.full(solid.shape, -1, dtype=np.int16)
         nostud = set()
         wedges = []
-        self._fill_print_grid(parts, solid, nostud, wedges, scale)
+        self._fill_print_grid(parts, solid, nostud, wedges, scale, paint)
         return {
             "parts": parts,
             "ldraw": ldraw,
             "warnings": warnings,
             "solid": solid,
+            "paint": paint,
             "nostud": nostud,
             "wedges": wedges,
             "scale": scale,
@@ -1680,20 +1727,23 @@ class MinecraftToLegoConverter:
             )
         return "\n".join(lines) + "\n"
 
-    def _fill_print_grid(self, parts, solid, nostud, wedges, scale):
+    def _fill_print_grid(self, parts, solid, nostud, wedges, scale, paint=None):
         """Fill a plate-and-stud grid from the same parts the LDraw file uses.
 
         One plate is 3.2 mm, one stud is 8 mm. A slope is not a box: it is
         recorded as a wedge so the printed stair actually slopes.
+        paint stores the LDraw color of each filled cell for the Bambu file.
         """
         ny, nz, nx = solid.shape
         plates_per = 3 * scale
         qstud = {"NW": (0, 0), "NE": (1, 0), "SW": (0, 1), "SE": (1, 1)}
 
-        def fill_studs(ix, iz, iy0, iy1):
+        def fill_studs(ix, iz, iy0, iy1, color):
             for iy in range(iy0, iy1):
                 if 0 <= iy < ny and 0 <= iz < nz and 0 <= ix < nx:
                     solid[iy, iz, ix] = True
+                    if paint is not None:
+                        paint[iy, iz, ix] = color
 
         for p in parts:
             y = p["y_mc"]
@@ -1715,6 +1765,7 @@ class MinecraftToLegoConverter:
                     "z1": (max(izs) + 1) * 8.0,
                     "y_base": (y * plates_per + 3) * 3.2,
                     "high": p.get("high") or "north",
+                    "color": p["color"],
                 })
                 continue
             if p["kind"] == "plate":
@@ -1722,7 +1773,7 @@ class MinecraftToLegoConverter:
                     iy = y_mc * plates_per + (plates_per - 1 if p.get("plate_top") else 0)
                     for dz in range(scale):
                         for dx in range(scale):
-                            fill_studs(x * scale + dx, z * scale + dz, iy, iy + 1)
+                            fill_studs(x * scale + dx, z * scale + dz, iy, iy + 1, p["color"])
                 continue
             if p.get("quads"):
                 iy0 = y * plates_per + (3 if p["sub"] == "upper" else 0)
@@ -1730,7 +1781,7 @@ class MinecraftToLegoConverter:
                     dx, dz = qstud[q]
                     x = p["cells"][0][2]
                     z = p["cells"][0][1]
-                    fill_studs(x * scale + dx, z * scale + dz, iy0, iy0 + 3)
+                    fill_studs(x * scale + dx, z * scale + dz, iy0, iy0 + 3, p["color"])
                 continue
             # Full bricks: 3 plates per brick layer, every stud of each cell.
             if scale == 1 or p["sub"] == "full":
@@ -1742,7 +1793,7 @@ class MinecraftToLegoConverter:
             for y_mc, z, x in p["cells"]:
                 for dz in range(scale):
                     for dx in range(scale):
-                        fill_studs(x * scale + dx, z * scale + dz, iy0, iy0 + 3)
+                        fill_studs(x * scale + dx, z * scale + dz, iy0, iy0 + 3, p["color"])
 
     def write_stl(self, path: str, model: Dict) -> int:
         """Write a binary STL in millimeters, Y up, base on the bed.
@@ -1950,6 +2001,479 @@ class MinecraftToLegoConverter:
                     handle.write(struct.pack("<3f", float(p[0]), float(p[1]), float(p[2])))
                 handle.write(struct.pack("<H", 0))
 
+    def _color_rgb(self, color_id):
+        item = LDRAW_COLORS.get(int(color_id))
+        if item:
+            return item[1], item[2], item[3]
+        return 155, 161, 157
+
+    def _color_name(self, color_id):
+        item = LDRAW_COLORS.get(int(color_id))
+        return item[0] if item else f"Color {int(color_id)}"
+
+    def _filament_groups(self, paint, wedges, max_colors):
+        """Keep the most common brick colors, up to max_colors. The rest join the nearest one."""
+        counts = {}
+        used = paint[paint >= 0]
+        if used.size:
+            values, amounts = np.unique(used, return_counts=True)
+            for value, amount in zip(values.tolist(), amounts.tolist()):
+                counts[int(value)] = counts.get(int(value), 0) + int(amount)
+        for wedge in wedges:
+            counts[int(wedge["color"])] = counts.get(int(wedge["color"]), 0) + 1
+        if not counts:
+            return []
+        ranked = sorted(counts, key=lambda color: counts[color], reverse=True)
+        anchors = ranked[:max_colors]
+
+        def nearest(color):
+            cr, cg, cb = self._color_rgb(color)
+            return min(anchors, key=lambda anchor: sum(
+                (a - b) ** 2 for a, b in zip((cr, cg, cb), self._color_rgb(anchor))
+            ))
+
+        groups = []
+        for anchor in anchors:
+            members = [color for color in ranked if nearest(color) == anchor]
+            groups.append((anchor, members, sum(counts[color] for color in members)))
+        return groups
+
+    def _mesh_studs_split(self, solid, nostud, paint):
+        """Studs on the exposed top only, filed under that cell's color."""
+        buckets = {}
+        if solid.size == 0 or not solid.any():
+            return buckets
+        top = solid.shape[0] - 1 - np.argmax(solid[::-1], axis=0)
+        has = solid.any(axis=0)
+        izs, ixs = np.where(has)
+        for iz, ix in zip(izs.tolist(), ixs.tolist()):
+            iy = int(top[iz, ix])
+            if (ix, iz, iy) in nostud:
+                continue
+            color = int(paint[iy, iz, ix])
+            dest = buckets.setdefault(color, [])
+            self._add_stud(dest, ix * 8.0 + 4.0, iz * 8.0 + 4.0, (iy + 1) * 3.2)
+        return buckets
+
+    def _base_color(self, paint):
+        for iy in range(paint.shape[0]):
+            used = paint[iy]
+            used = used[used >= 0]
+            if used.size:
+                values, amounts = np.unique(used, return_counts=True)
+                return int(values[int(np.argmax(amounts))])
+        return 7
+
+    def _orient_closed(self, tris):
+        if not tris:
+            return tris
+        volume = 0.0
+        for a, b, c in tris:
+            volume += float(np.dot(a, np.cross(b, c)))
+        if volume < 0:
+            return [(a, c, b) for a, b, c in tris]
+        return tris
+
+    def write_bambu(self, path: str, model: Dict, max_colors: int = 4):
+        """Write one Bambu Studio 3MF. Each filament is an object in the same place.
+
+        An STL cannot carry color, and separate STL files land apart on the plate.
+        This file keeps the colors stacked and assigns each group to a filament slot.
+        """
+        max_colors = max(1, min(8, int(max_colors)))
+        paint = model["paint"]
+        groups = self._filament_groups(paint, model["wedges"], max_colors)
+        if not groups:
+            raise RuntimeError("Bambu file is empty — the schematic had no solid blocks")
+        studs = self._mesh_studs_split(model["solid"], model["nostud"], paint)
+        base_tris = []
+        self._mesh_base(model["solid"], base_tris)
+        base_color = self._base_color(paint)
+        objects = []
+        notes = []
+        for slot, (anchor, members, _count) in enumerate(groups, start=1):
+            member_set = set(members)
+            mask = np.isin(paint, list(member_set))
+            tris = []
+            self._mesh_voxels(mask, tris)
+            for color in member_set:
+                tris.extend(studs.get(color, []))
+            wedges = [wedge for wedge in model["wedges"] if int(wedge["color"]) in member_set]
+            self._mesh_wedges(wedges, tris)
+            if base_color in member_set:
+                tris.extend(base_tris)
+            tris = self._orient_closed(tris)
+            if not tris:
+                continue
+            name = self._color_name(anchor)
+            also = [self._color_name(color) for color in members if color != anchor]
+            if also:
+                notes.append(f"Filament {slot} {name} — also {', '.join(also)}")
+            else:
+                notes.append(f"Filament {slot} {name}")
+            objects.append({
+                "slot": slot,
+                "name": f"{slot} {name}",
+                "rgb": self._color_rgb(anchor),
+                "also": also,
+                "tris": tris,
+            })
+        if not objects:
+            raise RuntimeError("Bambu file is empty — the schematic had no solid blocks")
+        objects = self._drop_meshes_onto_bed(objects)
+        self._write_bambu_3mf(path, objects)
+        for note in notes:
+            print(note)
+        print(f"Saved Bambu 3MF: {path} ({len(objects)} filaments)")
+        return notes
+
+    def _rgb_from_name(self, name):
+        """'1 Brown' or 'Brown' back to the LDraw red, green, and blue."""
+        cleaned = re.sub(r"^\d+\s+", "", name or "").strip()
+        for _color_id, (color_name, red, green, blue) in LDRAW_COLORS.items():
+            if color_name == cleaned:
+                return red, green, blue
+        return 155, 161, 157
+
+    def read_bambu(self, path):
+        """Read a 3MF this program wrote. Each spool keeps its mesh and suggested color."""
+        spools = []
+        with zipfile.ZipFile(path) as archive:
+            settings = archive.read("Metadata/model_settings.config").decode("utf-8")
+            for obj_id, body in re.findall(r'<object id="(\d+)">(.*?)</object>', settings, re.S):
+                head = body.split("<part", 1)[0]
+                meta = dict(re.findall(r'<metadata key="([^"]+)" value="([^"]*)"', head))
+                raw_name = meta.get("name") or f"Spool {obj_id}"
+                label = re.sub(r"^\d+\s+", "", raw_name).strip() or raw_name
+                rgb_text = meta.get("color_rgb", "")
+                parts = rgb_text.split(",")
+                if len(parts) == 3:
+                    try:
+                        rgb = tuple(int(part) for part in parts)
+                    except ValueError:
+                        rgb = self._rgb_from_name(label)
+                else:
+                    rgb = self._rgb_from_name(label)
+                also = [item.strip() for item in meta.get("color_also", "").split(",") if item.strip()]
+                mesh_name = f"3D/Objects/object_{obj_id}.model"
+                if mesh_name not in archive.namelist():
+                    raise RuntimeError(f"Bambu file is missing {mesh_name}")
+                xml = archive.read(mesh_name).decode("utf-8")
+                vertices = [
+                    (float(x), float(y), float(z))
+                    for x, y, z in re.findall(
+                        r'x="([\d.eE+-]+)" y="([\d.eE+-]+)" z="([\d.eE+-]+)"', xml
+                    )
+                ]
+                faces = [
+                    (int(a), int(b), int(c))
+                    for a, b, c in re.findall(r'v1="(\d+)" v2="(\d+)" v3="(\d+)"', xml)
+                ]
+                spools.append({
+                    "label": label,
+                    "rgb": rgb,
+                    "also": also,
+                    "vertices": vertices,
+                    "faces": faces,
+                })
+        if not spools:
+            raise RuntimeError("That Bambu file has no color objects")
+        return spools
+
+    def plan_spool_groups(self, spools, max_colors):
+        """Keep the biggest spool colors, up to max_colors. The others join the nearest color."""
+        max_colors = max(1, min(8, int(max_colors)))
+        ranked = sorted(spools, key=lambda spool: len(spool["faces"]), reverse=True)
+        anchors = ranked[:max_colors]
+
+        def nearest(spool):
+            red, green, blue = spool["rgb"]
+            return min(anchors, key=lambda anchor: sum(
+                (left - right) ** 2
+                for left, right in zip((red, green, blue), anchor["rgb"])
+            ))
+
+        groups = []
+        for anchor in anchors:
+            members = [spool for spool in ranked if nearest(spool) is anchor]
+            if members:
+                groups.append(members)
+        return groups
+
+    def save_regrouped_bambu(self, path, spools, max_colors):
+        """Write a new 3MF with fewer filaments. Meshes stay in the same place."""
+        groups = self.plan_spool_groups(spools, max_colors)
+        objects = []
+        notes = []
+        for slot, members in enumerate(groups, start=1):
+            anchor = max(members, key=lambda spool: len(spool["faces"]))
+            vertices = []
+            faces = []
+            offset = 0
+            also = []
+            for member in members:
+                vertices.extend(member["vertices"])
+                faces.extend(
+                    (a + offset, b + offset, c + offset) for a, b, c in member["faces"]
+                )
+                offset += len(member["vertices"])
+                if member is not anchor:
+                    also.append(member["label"])
+                also.extend(member.get("also") or [])
+            seen = set()
+            also_unique = []
+            for name in also:
+                if name and name != anchor["label"] and name not in seen:
+                    seen.add(name)
+                    also_unique.append(name)
+            if also_unique:
+                note = f"Spool {slot}  {anchor['label']} — also {', '.join(also_unique)}"
+            else:
+                note = f"Spool {slot}  {anchor['label']}"
+            notes.append(note)
+            objects.append({
+                "slot": slot,
+                "name": f"{slot} {anchor['label']}",
+                "rgb": anchor["rgb"],
+                "also": also_unique,
+                "vertices": vertices,
+                "faces": faces,
+            })
+        self._write_bambu_3mf(path, objects)
+        for note in notes:
+            print(note)
+        print(f"Saved Bambu 3MF: {path} ({len(objects)} filaments)")
+        return notes
+
+    def _drop_meshes_onto_bed(self, objects):
+        """Turn Y-up millimeters into Z-up, and use one shift so every color stays stacked."""
+        converted = []
+        mins = [float("inf"), float("inf"), float("inf")]
+        for obj in objects:
+            tris = []
+            for a, b, c in obj["tris"]:
+                pts = []
+                for point in (a, b, c):
+                    # Y was up. Bambu Studio uses Z up.
+                    moved = (point[0], -point[2], point[1])
+                    mins[0] = min(mins[0], moved[0])
+                    mins[1] = min(mins[1], moved[1])
+                    mins[2] = min(mins[2], moved[2])
+                    pts.append(moved)
+                tris.append(tuple(pts))
+            converted.append(tris)
+        dropped = []
+        for obj, tris in zip(objects, converted):
+            shifted = []
+            for a, b, c in tris:
+                shifted.append(tuple((p[0] - mins[0], p[1] - mins[1], p[2] - mins[2]) for p in (a, b, c)))
+            item = dict(obj)
+            item["tris"] = shifted
+            dropped.append(item)
+        return dropped
+
+    def _write_bambu_3mf(self, path, objects):
+        """Bambu Studio project 3MF: one mesh per filament, identical placement, slot in model_settings."""
+        os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+        identity = "1 0 0 0 1 0 0 0 1 0 0 0"
+        mesh_xml = []
+        main_objects = []
+        rels = []
+        settings = []
+        instances = []
+        assemble = []
+        for index, obj in enumerate(objects, start=1):
+            # A regrouped file already has welded vertices. A new export still has triangles.
+            if obj.get("faces") is not None:
+                vertices, faces = obj["vertices"], obj["faces"]
+            else:
+                vertices, faces = self._weld_triangles(obj["tris"])
+            mesh_xml.append(self._bambu_object_model(index, vertices, faces, obj.get("rgb")))
+            main_objects.append(
+                f'  <object id="{index}" p:UUID="{index:08d}-61cb-4c03-9d28-80fed5dfa1dc" type="model">\n'
+                f'   <components>\n'
+                f'    <component p:path="/3D/Objects/object_{index}.model" objectid="1" '
+                f'p:UUID="{index:08d}-b206-40ff-9872-83e8017abed1" transform="{identity}"/>\n'
+                f'   </components>\n'
+                f'  </object>'
+            )
+            rels.append(
+                f' <Relationship Target="/3D/Objects/object_{index}.model" Id="rel-{index}" '
+                f'Type="http://schemas.microsoft.com/3dmanufacturing/2013/01/3dmodel"/>'
+            )
+            safe = (obj["name"].replace("&", "&amp;").replace("<", "&lt;").replace('"', "&quot;"))
+            red, green, blue = obj.get("rgb") or (155, 161, 157)
+            also = ", ".join(obj.get("also") or [])
+            also_safe = also.replace("&", "&amp;").replace("<", "&lt;").replace('"', "&quot;")
+            # color_rgb and color_also let a saved file be opened later and merged into fewer spools.
+            settings.append(
+                f'  <object id="{index}">\n'
+                f'    <metadata key="name" value="{safe}"/>\n'
+                f'    <metadata key="extruder" value="{obj["slot"]}"/>\n'
+                f'    <metadata key="color_rgb" value="{red},{green},{blue}"/>\n'
+                f'    <metadata key="color_also" value="{also_safe}"/>\n'
+                f'    <part id="1" subtype="normal_part">\n'
+                f'      <metadata key="name" value="{safe}"/>\n'
+                f'      <metadata key="matrix" value="1 0 0 0 0 1 0 0 0 0 1 0 0 0 0 1"/>\n'
+                f'      <metadata key="extruder" value="{obj["slot"]}"/>\n'
+                f'      <mesh_stat face_count="{len(faces)}" edges_fixed="0" degenerate_facets="0" '
+                f'facets_removed="0" facets_reversed="0" backwards_edges="0"/>\n'
+                f'    </part>\n'
+                f'  </object>'
+            )
+            instances.append(
+                f'    <model_instance>\n'
+                f'      <metadata key="object_id" value="{index}"/>\n'
+                f'      <metadata key="instance_id" value="0"/>\n'
+                f'      <metadata key="identify_id" value="{1000 + index}"/>\n'
+                f'    </model_instance>'
+            )
+            assemble.append(
+                f'   <assemble_item object_id="{index}" instance_id="0" transform="{identity}" offset="0 0 0" />'
+            )
+        build_items = "\n".join(
+            f'  <item objectid="{index}" p:UUID="{index:08d}-b1ec-4553-aec9-835e5b724bb4" '
+            f'transform="{identity}" printable="1"/>'
+            for index in range(1, len(objects) + 1)
+        )
+        # Same transform on every item, so the colors stay in one stack.
+        model_xml = (
+            '<?xml version="1.0" encoding="UTF-8"?>\n'
+            '<model unit="millimeter" xml:lang="en-US" '
+            'xmlns="http://schemas.microsoft.com/3dmanufacturing/core/2015/02" '
+            'xmlns:BambuStudio="http://schemas.bambulab.com/package/2021" '
+            'xmlns:p="http://schemas.microsoft.com/3dmanufacturing/production/2015/06" requiredextensions="p">\n'
+            ' <metadata name="Application">BambuStudio-02.00.02.01</metadata>\n'
+            ' <metadata name="BambuStudio:3mfVersion">1</metadata>\n'
+            ' <resources>\n'
+            + "\n".join(main_objects) + "\n"
+            ' </resources>\n'
+            ' <build p:UUID="2c7c17d8-22b5-4d84-8835-1976022ea369">\n'
+            + build_items + "\n"
+            ' </build>\n</model>\n'
+        )
+        settings_xml = (
+            '<?xml version="1.0" encoding="UTF-8"?>\n<config>\n'
+            + "\n".join(settings) + "\n"
+            '  <plate>\n'
+            '    <metadata key="plater_id" value="1"/>\n'
+            '    <metadata key="plater_name" value=""/>\n'
+            '    <metadata key="locked" value="false"/>\n'
+            '    <metadata key="first_layer_print_sequence" value="1 2 3 4 5 6 7 8"/>\n'
+            '    <metadata key="filament_map_mode" value="Auto For Flush"/>\n'
+            '    <metadata key="filament_maps" value="1 1 1 1 1 1 1 1"/>\n'
+            + "\n".join(instances) + "\n"
+            '  </plate>\n'
+            '  <assemble>\n'
+            + "\n".join(assemble) + "\n"
+            '  </assemble>\n</config>\n'
+        )
+        content_types = (
+            '<?xml version="1.0" encoding="UTF-8"?>\n'
+            '<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types">\n'
+            ' <Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/>\n'
+            ' <Default Extension="model" ContentType="application/vnd.ms-package.3dmanufacturing-3dmodel+xml"/>\n'
+            '</Types>\n'
+        )
+        root_rels = (
+            '<?xml version="1.0" encoding="UTF-8"?>\n'
+            '<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">\n'
+            ' <Relationship Target="/3D/3dmodel.model" Id="rel-1" '
+            'Type="http://schemas.microsoft.com/3dmanufacturing/2013/01/3dmodel"/>\n'
+            '</Relationships>\n'
+        )
+        model_rels = (
+            '<?xml version="1.0" encoding="UTF-8"?>\n'
+            '<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">\n'
+            + "\n".join(rels) + "\n"
+            '</Relationships>\n'
+        )
+        with zipfile.ZipFile(path, "w", compression=zipfile.ZIP_DEFLATED) as archive:
+            archive.writestr("[Content_Types].xml", content_types)
+            archive.writestr("_rels/.rels", root_rels)
+            archive.writestr("3D/3dmodel.model", model_xml)
+            archive.writestr("3D/_rels/3dmodel.model.rels", model_rels)
+            archive.writestr("Metadata/model_settings.config", settings_xml)
+            # Without this, Bambu Studio says the config is invalid and drops the spool colors.
+            project_settings = self._bambu_project_settings(objects)
+            if project_settings:
+                archive.writestr("Metadata/project_settings.config", project_settings)
+            for index, xml in enumerate(mesh_xml, start=1):
+                archive.writestr(f"3D/Objects/object_{index}.model", xml)
+
+    def _weld_triangles(self, tris):
+        index = {}
+        vertices = []
+        faces = []
+        for tri in tris:
+            ids = []
+            for point in tri:
+                key = (round(float(point[0]), 4), round(float(point[1]), 4), round(float(point[2]), 4))
+                slot = index.get(key)
+                if slot is None:
+                    slot = len(vertices)
+                    index[key] = slot
+                    vertices.append(key)
+                ids.append(slot)
+            if len(set(ids)) == 3:
+                faces.append(ids)
+        return vertices, faces
+
+    def _bambu_project_settings(self, objects):
+        """Printer config from this Mac's Bambu Studio, with the spool colors filled in.
+
+        The app ships an 8-filament H2D project. Reusing it keeps filament_extruder_variant
+        and filament_self_index in the shape this Bambu Studio version accepts.
+        """
+        template = "/Applications/BambuStudio.app/Contents/Resources/calib/pressure_advance/auto_pa_line_dual.3mf"
+        if not os.path.isfile(template):
+            return None
+        with zipfile.ZipFile(template) as archive:
+            data = json.loads(archive.read("Metadata/project_settings.config"))
+        colours = list(data.get("filament_colour") or [])
+        for index, obj in enumerate(objects):
+            if index >= len(colours):
+                break
+            red, green, blue = obj.get("rgb") or (155, 161, 157)
+            colours[index] = f"#{int(red):02X}{int(green):02X}{int(blue):02X}"
+        for index in range(len(objects), len(colours)):
+            colours[index] = "#D0D0D0"
+        data["filament_colour"] = colours
+        return json.dumps(data, indent=4) + "\n"
+
+    def _bambu_object_model(self, index, vertices, faces, rgb=None):
+        verts = "\n".join(
+            f'     <vertex x="{x:.4f}" y="{y:.4f}" z="{z:.4f}"/>' for x, y, z in vertices
+        )
+        triangles = "\n".join(
+            f'     <triangle v1="{a}" v2="{b}" v3="{c}"/>' for a, b, c in faces
+        )
+        materials = ""
+        color_attr = ""
+        if rgb:
+            red, green, blue = rgb
+            materials = (
+                '  <basematerials id="1">\n'
+                f'   <base name="spool" displaycolor="#{int(red):02X}{int(green):02X}{int(blue):02X}"/>\n'
+                '  </basematerials>\n'
+            )
+            color_attr = ' pid="1" pindex="0"'
+        return (
+            '<?xml version="1.0" encoding="UTF-8"?>\n'
+            '<model unit="millimeter" xml:lang="en-US" '
+            'xmlns="http://schemas.microsoft.com/3dmanufacturing/core/2015/02" '
+            'xmlns:BambuStudio="http://schemas.bambulab.com/package/2021" '
+            'xmlns:p="http://schemas.microsoft.com/3dmanufacturing/production/2015/06" requiredextensions="p">\n'
+            ' <metadata name="BambuStudio:3mfVersion">1</metadata>\n'
+            ' <resources>\n'
+            + materials
+            + f'  <object id="1"{color_attr} p:UUID="{index:08d}-81cb-4c03-9d28-80fed5dfa1dc" type="model">\n'
+            '   <mesh>\n    <vertices>\n'
+            + verts + "\n    </vertices>\n    <triangles>\n"
+            + triangles + "\n    </triangles>\n   </mesh>\n  </object>\n"
+            ' </resources>\n</model>\n'
+        )
+
     def convert_to_ldraw(self, schematic_data: Dict, optimize: bool = False, scale: int = 1) -> str:
         """
         Convert schematic data to LDraw format.
@@ -1982,7 +2506,7 @@ class MinecraftToLegoConverter:
         except Exception as e:
             print(f"Error saving LDraw file: {e}")
 
-    def convert_file(self, input_path: str, output_path: str = None, optimize: bool = False, scale: int = 1, stl_path: str = None) -> bool:
+    def convert_file(self, input_path: str, output_path: str = None, optimize: bool = False, scale: int = 1, stl_path: str = None, bambu_path: str = None, bambu_colors: int = 4) -> bool:
         """
         Convert a single Minecraft schematic file to LDraw and, optionally, STL.
 
@@ -1992,6 +2516,8 @@ class MinecraftToLegoConverter:
             optimize: If True, merge adjacent same-color blocks into larger bricks
             scale: Scale factor (1 = 1 stud per block, 2 = 2 studs per block)
             stl_path: If set, also write a printable STL of the same model
+            bambu_path: If set, also write a Bambu Studio 3MF with one object per filament
+            bambu_colors: How many filaments to group the brick colors into (1-8)
 
         Returns:
             True if conversion successful, False otherwise
@@ -2016,6 +2542,8 @@ class MinecraftToLegoConverter:
         self.save_ldraw_file(model["ldraw"], output_path)
         if stl_path:
             self.write_stl(stl_path, model)
+        if bambu_path:
+            self.write_bambu(bambu_path, model, bambu_colors)
         print(f"Converted to {model['stats']['bricks']} Lego bricks")
         return True
 
@@ -2165,6 +2693,8 @@ def main():
     parser.add_argument("input", help="Input Minecraft schematic file (.schematic or .schem)")
     parser.add_argument("-o", "--output", help="Output LDraw file (.ldr)")
     parser.add_argument("--stl", help="Also write a printable STL")
+    parser.add_argument("--bambu", help="Also write a Bambu Studio 3MF, one object per filament, already lined up")
+    parser.add_argument("--colors", type=int, default=4, help="Filaments in the Bambu file, from 1 to 8")
     parser.add_argument("--optimize", action="store_true", help="Merge adjacent same-color blocks into larger bricks")
     parser.add_argument("-v", "--verbose", action="store_true", help="Verbose output")
     parser.add_argument("--scale", type=int, choices=[1, 2], default=2,
@@ -2180,7 +2710,8 @@ def main():
         print(f"Scale: {args.scale}x")
 
     success = converter.convert_file(
-        args.input, args.output, optimize=args.optimize, scale=args.scale, stl_path=args.stl)
+        args.input, args.output, optimize=args.optimize, scale=args.scale, stl_path=args.stl,
+        bambu_path=args.bambu, bambu_colors=args.colors)
 
     if success:
         print("Conversion completed successfully!")
