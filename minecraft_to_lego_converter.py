@@ -1697,6 +1697,9 @@ class MinecraftToLegoConverter:
         # A block a few plates above the floor (or above where water was) joins
         # the board. The LEGO file is unchanged; this is only the printed mesh.
         self._join_floating_blocks(solid, paint, scale)
+        # Same-color bricks that only meet at a corner become broken edges.
+        # Bambu then drops those parts and draws the whole model gray.
+        self._close_color_pinches(solid, paint)
         return {
             "parts": parts,
             "ldraw": ldraw,
@@ -2010,8 +2013,70 @@ class MinecraftToLegoConverter:
                     for fill_y in range(iy - 1, start - 1, -1):
                         if pinches(fill_y, iz, ix):
                             break
-                        solid[fill_y, iz, ix] = True
-                        paint[fill_y, iz, ix] = color
+                    solid[fill_y, iz, ix] = True
+                    paint[fill_y, iz, ix] = color
+
+    def _close_color_pinches(self, solid, paint):
+        """Give two same-color cells that only share an edge a shared face.
+
+        Around that edge the other two cells take the same color. The color
+        shells stay closed, so the slicer can draw each spool.
+        """
+        def seal(a, b, d, e):
+            """a and e are one diagonal, b and d the other. Copies, not views.
+
+            Paint one of the other two cells when the diagonal only shares an
+            edge: either both are the same color, or both are solid and the
+            other two are air.
+            """
+            same = (a >= 0) & (a == e) & (b != a) & (d != a)
+            air = (a >= 0) & (e >= 0) & (b < 0) & (d < 0)
+            paint_b = same | air
+            same2 = (b >= 0) & (b == d) & (a != b) & (e != b) & ~paint_b
+            air2 = (b >= 0) & (d >= 0) & (a < 0) & (e < 0) & ~paint_b
+            paint_a = same2 | air2
+            return paint_b, paint_a
+
+        # A cell is painted once. Later passes must not flip it back.
+        locked = np.zeros(paint.shape, dtype=bool)
+
+        def write(dest, dest_solid, dest_lock, mask, colors):
+            allowed = mask & ~dest_lock
+            if not allowed.any():
+                return 0
+            dest[allowed] = colors[allowed]
+            dest_solid[allowed] = True
+            dest_lock[allowed] = True
+            return int(allowed.sum())
+
+        for _ in range(6):
+            changed = 0
+            # Edges that run along Y. The four cells sit in the Z/X plane.
+            a = paint[:, :-1, :-1].copy()
+            b = paint[:, :-1, 1:].copy()
+            d = paint[:, 1:, :-1].copy()
+            e = paint[:, 1:, 1:].copy()
+            paint_b, paint_a = seal(a, b, d, e)
+            changed += write(paint[:, :-1, 1:], solid[:, :-1, 1:], locked[:, :-1, 1:], paint_b, a)
+            changed += write(paint[:, :-1, :-1], solid[:, :-1, :-1], locked[:, :-1, :-1], paint_a, b)
+            # Edges that run along Z. The four cells sit in the Y/X plane.
+            a = paint[:-1, :, :-1].copy()
+            b = paint[:-1, :, 1:].copy()
+            d = paint[1:, :, :-1].copy()
+            e = paint[1:, :, 1:].copy()
+            paint_b, paint_a = seal(a, b, d, e)
+            changed += write(paint[:-1, :, 1:], solid[:-1, :, 1:], locked[:-1, :, 1:], paint_b, a)
+            changed += write(paint[:-1, :, :-1], solid[:-1, :, :-1], locked[:-1, :, :-1], paint_a, b)
+            # Edges that run along X. The four cells sit in the Y/Z plane.
+            a = paint[:-1, :-1, :].copy()
+            b = paint[:-1, 1:, :].copy()
+            d = paint[1:, :-1, :].copy()
+            e = paint[1:, 1:, :].copy()
+            paint_b, paint_a = seal(a, b, d, e)
+            changed += write(paint[:-1, 1:, :], solid[:-1, 1:, :], locked[:-1, 1:, :], paint_b, a)
+            changed += write(paint[:-1, :-1, :], solid[:-1, :-1, :], locked[:-1, :-1, :], paint_a, b)
+            if changed == 0:
+                break
 
     def _mesh_base(self, solid, tris):
         """One plate under the whole footprint, so the print sits on a solid board."""
@@ -2127,6 +2192,16 @@ class MinecraftToLegoConverter:
             return [(a, c, b) for a, b, c in tris]
         return tris
 
+    def _fuse_filament_grid(self, solid, paint, groups):
+        """Copy the grid, then treat every color on one spool as one color."""
+        fused_paint = paint.copy()
+        fused_solid = solid.copy()
+        for anchor, members, _count in groups:
+            if len(members) > 1:
+                fused_paint[np.isin(paint, members)] = anchor
+        self._close_color_pinches(fused_solid, fused_paint)
+        return fused_solid, fused_paint
+
     def write_bambu(self, path: str, model: Dict, max_colors: int = 4):
         """Write one Bambu Studio 3MF. Each filament is an object in the same place.
 
@@ -2134,13 +2209,14 @@ class MinecraftToLegoConverter:
         This file keeps the colors stacked and assigns each group to a filament slot.
         """
         max_colors = max(1, min(8, int(max_colors)))
-        paint = model["paint"]
-        groups = self._filament_groups(paint, model["wedges"], max_colors)
+        groups = self._filament_groups(model["paint"], model["wedges"], max_colors)
         if not groups:
             raise RuntimeError("Bambu file is empty — the schematic had no solid blocks")
-        studs = self._mesh_studs_split(model["solid"], model["nostud"], paint)
+        # Colors that share a spool have to meet face to face, or the shell breaks.
+        solid, paint = self._fuse_filament_grid(model["solid"], model["paint"], groups)
+        studs = self._mesh_studs_split(solid, model["nostud"], paint)
         base_tris = []
-        self._mesh_base(model["solid"], base_tris)
+        self._mesh_base(solid, base_tris)
         base_color = self._base_color(paint)
         objects = []
         notes = []
@@ -2353,13 +2429,28 @@ class MinecraftToLegoConverter:
                     pts.append(moved)
                 tris.append(tuple(pts))
             converted.append(tris)
-        dropped = []
-        for obj, tris in zip(objects, converted):
+        # H2D bed is 350 x 320. A corner at 0 sits on the front edge.
+        span_x = span_y = 0.0
+        placed = []
+        for tris in converted:
             shifted = []
             for a, b, c in tris:
-                shifted.append(tuple((p[0] - mins[0], p[1] - mins[1], p[2] - mins[2]) for p in (a, b, c)))
+                pts = tuple((p[0] - mins[0], p[1] - mins[1], p[2] - mins[2]) for p in (a, b, c))
+                for point in pts:
+                    span_x = max(span_x, point[0])
+                    span_y = max(span_y, point[1])
+                shifted.append(pts)
+            placed.append(shifted)
+        bed_x, bed_y = 350.0, 320.0
+        off_x = max(0.0, (bed_x - span_x) / 2.0)
+        off_y = max(0.0, (bed_y - span_y) / 2.0)
+        dropped = []
+        for obj, tris in zip(objects, placed):
+            centered = []
+            for a, b, c in tris:
+                centered.append(tuple((p[0] + off_x, p[1] + off_y, p[2]) for p in (a, b, c)))
             item = dict(obj)
-            item["tris"] = shifted
+            item["tris"] = centered
             dropped.append(item)
         return dropped
 
@@ -2530,6 +2621,19 @@ class MinecraftToLegoConverter:
         for index in range(len(objects), len(colours)):
             colours[index] = "#D0D0D0"
         data["filament_colour"] = colours
+        # The PLA preset would otherwise replace these with one gray.
+        # Slot 0 is the process, slot 1 is the printer, then one entry per filament.
+        diffs = list(data.get("different_settings_to_system") or [])
+        for index in range(len(colours)):
+            slot = index + 2
+            if slot >= len(diffs):
+                break
+            parts = [item for item in str(diffs[slot]).split(";") if item and item != "filament_colour"]
+            parts.append("filament_colour")
+            diffs[slot] = ";".join(parts)
+        data["different_settings_to_system"] = diffs
+        if isinstance(data.get("default_filament_colour"), list) and len(data["default_filament_colour"]) == len(colours):
+            data["default_filament_colour"] = list(colours)
         return json.dumps(data, indent=4) + "\n"
 
     def _bambu_object_model(self, index, vertices, faces, rgb=None):
