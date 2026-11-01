@@ -397,6 +397,9 @@ class ConverterWindow:
                     bambu_notes = converter.write_bambu(bambu_path, model, filament_count)
                     progress("Reading the spool colors…")
                     spools = converter.read_bambu(bambu_path)
+                fit_note = getattr(converter, "print_fit_note", "")
+                if fit_note and fit_note not in bambu_notes:
+                    progress(fit_note)
                 self.messages.put(("done", {
                     "ldr": ldr_path,
                     "stl": stl_path,

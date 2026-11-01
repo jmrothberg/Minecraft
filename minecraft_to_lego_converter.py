@@ -190,6 +190,9 @@ class MinecraftToLegoConverter:
             # Brewing, enchanting, anvil (irregular shapes)
             "brewing_stand", "cauldron", "water_cauldron", "lava_cauldron",
             "powder_snow_cauldron", "anvil", "chipped_anvil", "damaged_anvil",
+            # A pool is not a brick. Leaving it in turns the water into a solid slab
+            # and leaves the real build sitting a few blocks above that slab.
+            "water", "lava", "bubble_column",
             # NOTE: Fences, fence gates, and walls are kept as full bricks.
             # They're thin in Minecraft but commonly serve as structural supports
             # (columns, railings, table legs, etc). Skipping them causes floating structures.
@@ -1355,6 +1358,9 @@ class MinecraftToLegoConverter:
             if color < 0 or self._is_skip_block(block_name):
                 return None, None
             return color, self._get_special_part_info(block_name)
+        # Old .schematic ids: 8/9 water, 10/11 lava. Same reason as skip_blocks.
+        if block_id in (8, 9, 10, 11):
+            return None, None
         data_value = 0
         if schematic_data.get("data") is not None:
             index = y * length * width + z * width + x
@@ -1688,6 +1694,9 @@ class MinecraftToLegoConverter:
         nostud = set()
         wedges = []
         self._fill_print_grid(parts, solid, nostud, wedges, scale, paint)
+        # A block a few plates above the floor (or above where water was) joins
+        # the board. The LEGO file is unchanged; this is only the printed mesh.
+        self._join_floating_blocks(solid, paint, scale)
         return {
             "parts": parts,
             "ldraw": ldraw,
@@ -1820,7 +1829,12 @@ class MinecraftToLegoConverter:
         shifted = []
         for a, b, c in tris:
             shifted.append(tuple((p[0], p[1] - min_y, p[2]) for p in (a, b, c)))
+        shifted, note = self._shrink_to_bed([shifted])
+        shifted = shifted[0]
+        self.print_fit_note = note
         self._write_binary_stl(path, shifted)
+        if note:
+            print(note)
         print(f"Saved STL: {path} ({len(shifted)} triangles)")
         return len(shifted)
 
@@ -1952,24 +1966,63 @@ class MinecraftToLegoConverter:
             tris.append((b0, l0, h0))
             tris.append((b1, h1, l1))
 
-    def _mesh_base(self, solid, tris):
-        """A flat plate under the lowest blocks, so the print has a bed to sit on."""
+    def _join_floating_blocks(self, solid, paint, scale):
+        """Fill a short vertical gap so a piece a few blocks up becomes part of the board.
+
+        Six blocks is the cutoff. A taller opening, such as a real story, stays open.
+        The filled cells take the color of the piece above them.
+        """
+        max_gap = 6 * 3 * scale
         ny, nz, nx = solid.shape
-        min_iy = None
-        xs, zs = [], []
-        for iy in range(ny):
-            if solid[iy].any():
-                min_iy = iy
-                for iz in range(nz):
-                    for ix in range(nx):
-                        if solid[iy, iz, ix]:
-                            xs.append(ix)
-                            zs.append(iz)
-                break
-        if min_iy is None:
+
+        def pinches(iy, iz, ix):
+            """True when this cell would touch another only at a corner.
+
+            A slicer treats that shared edge as a hole, so the gap stays open.
+            """
+            for dz, dx in ((1, 1), (1, -1), (-1, 1), (-1, -1)):
+                zz, xx = iz + dz, ix + dx
+                if not (0 <= zz < nz and 0 <= xx < nx) or not solid[iy, zz, xx]:
+                    continue
+                if solid[iy, iz, xx] or solid[iy, zz, ix]:
+                    continue
+                return True
+            return False
+
+        for iz in range(nz):
+            for ix in range(nx):
+                iy = 0
+                while iy < ny:
+                    if solid[iy, iz, ix]:
+                        iy += 1
+                        continue
+                    start = iy
+                    while iy < ny and not solid[iy, iz, ix]:
+                        iy += 1
+                    gap = iy - start
+                    if iy >= ny or gap > max_gap:
+                        continue
+                    color = int(paint[iy, iz, ix])
+                    if color < 0:
+                        continue
+                    # Grow downward from the piece. Stop at a cell that would only
+                    # meet a neighbor at a corner, so stairs stay a closed mesh.
+                    for fill_y in range(iy - 1, start - 1, -1):
+                        if pinches(fill_y, iz, ix):
+                            break
+                        solid[fill_y, iz, ix] = True
+                        paint[fill_y, iz, ix] = color
+
+    def _mesh_base(self, solid, tris):
+        """One plate under the whole footprint, so the print sits on a solid board."""
+        if solid.size == 0 or not solid.any():
             return
-        x0, x1 = min(xs) * 8.0, (max(xs) + 1) * 8.0
-        z0, z1 = min(zs) * 8.0, (max(zs) + 1) * 8.0
+        occupied = np.where(solid)
+        min_iy = int(occupied[0].min())
+        xs = occupied[2]
+        zs = occupied[1]
+        x0, x1 = float(xs.min()) * 8.0, float(xs.max() + 1) * 8.0
+        z0, z1 = float(zs.min()) * 8.0, float(zs.max() + 1) * 8.0
         y1 = min_iy * 3.2 + 0.15
         y0 = min_iy * 3.2 - 3.2
 
@@ -2120,6 +2173,12 @@ class MinecraftToLegoConverter:
             })
         if not objects:
             raise RuntimeError("Bambu file is empty — the schematic had no solid blocks")
+        fitted, note = self._shrink_to_bed([obj["tris"] for obj in objects])
+        for obj, tris in zip(objects, fitted):
+            obj["tris"] = tris
+        self.print_fit_note = note
+        if note:
+            notes.append(note)
         objects = self._drop_meshes_onto_bed(objects)
         self._write_bambu_3mf(path, objects)
         for note in notes:
@@ -2244,6 +2303,38 @@ class MinecraftToLegoConverter:
             print(note)
         print(f"Saved Bambu 3MF: {path} ({len(objects)} filaments)")
         return notes
+
+    def _shrink_to_bed(self, tri_groups):
+        """Shrink every mesh by the same amount so the longest side is 240 mm.
+
+        240 mm fits a Bambu X1 Carbon (256 mm bed) with room at the edge.
+        A model that is already smaller stays at real LEGO size, 8 mm per stud.
+        """
+        bed = 240.0
+        lo = [float("inf"), float("inf"), float("inf")]
+        hi = [float("-inf"), float("-inf"), float("-inf")]
+        for tris in tri_groups:
+            for tri in tris:
+                for point in tri:
+                    for axis in range(3):
+                        lo[axis] = min(lo[axis], point[axis])
+                        hi[axis] = max(hi[axis], point[axis])
+        span = max(hi[axis] - lo[axis] for axis in range(3))
+        if span <= bed or span <= 0:
+            return tri_groups, ""
+        factor = bed / span
+        fitted = []
+        for tris in tri_groups:
+            scaled = []
+            for a, b, c in tris:
+                scaled.append(tuple(
+                    tuple((point[axis] - lo[axis]) * factor for axis in range(3))
+                    for point in (a, b, c)
+                ))
+            fitted.append(scaled)
+        percent = int(round(factor * 100))
+        note = f"Scaled the print to {percent}% so the longest side is {bed:.0f} mm and it fits the bed."
+        return fitted, note
 
     def _drop_meshes_onto_bed(self, objects):
         """Turn Y-up millimeters into Z-up, and use one shift so every color stays stacked."""

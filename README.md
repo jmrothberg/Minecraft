@@ -40,7 +40,7 @@ The conversion pipeline has three stages:
    - Slabs are half a block. At 2× that is one brick in the lower or upper half. Carpet is a plate
    - **Merge** combines neighboring blocks of the same color into longer bricks (fewer pieces)
 
-3. **Output** — An LDraw `.ldr` file for LeoCAD, and a binary STL in millimeters (8 mm per stud, 9.6 mm per brick) with a base plate and studs on the exposed tops. Open the STL in MeshLab, then send it to your slicer. Optional: a Bambu Studio `.3mf` with one object per filament, already stacked, so the colors do not have to be lined up by hand. The window shows the suggested color of each spool. Load that file later, lower the filament count, and save a new file with fewer spools.
+3. **Output** — An LDraw `.ldr` file for LeoCAD, and a binary STL in millimeters (8 mm per stud, 9.6 mm per brick) with one base plate under the whole footprint and studs on the exposed tops. Water and lava are left out, and a piece that sat only a few blocks up is joined down onto that board. If the print is longer than 240 mm it is scaled down so the longest side fits a Bambu bed. Open the STL in MeshLab, then send it to your slicer. Optional: a Bambu Studio `.3mf` with one object per filament, already stacked, so the colors do not have to be lined up by hand. The window shows the suggested color of each spool. Load that file later, lower the filament count, and save a new file with fewer spools.
 
 ## Quick Start
 
